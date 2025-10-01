@@ -1,0 +1,96 @@
+#pragma once
+
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <winhttp.h>
+#include <oleauto.h>
+#include <process.h>
+#include <shellapi.h>
+#include <string>
+#include <map>
+#include <vector>
+#include <cmath>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winhttp.lib")
+
+#define DLLFUNC extern "C" __declspec(dllexport)
+
+extern int(__cdecl* BrokerMessage)(const char* Text);
+extern int(__cdecl* BrokerProgress)(intptr_t Progress);
+
+enum class CtraderEnv { Demo, Live };
+
+struct Trade {
+    int zorroId;
+    long long ctid;
+    std::string symbol;
+    int amount;
+    double openPrice;
+    double closePrice;
+    long long openTime;
+    long long closeTime;
+    double profit;
+    double commission;
+    double swap;
+    bool closed;
+};
+
+struct CsvCreds {
+    std::string clientId;
+    std::string clientSecret;
+    std::string type;
+    std::string accountId;
+    std::string accessToken;
+};
+
+struct GLOBAL {
+    char Token[2048];
+    char RefreshToken[2048];
+    int Diag;
+    long long CTraderAccountId;
+    CtraderEnv Env;
+    char ClientId[256];
+    char ClientSecret[256];
+    char RedirectUri[512];
+    char Scope[128];
+    char Product[64];
+    bool HasLogin;
+
+    HANDLE hNetworkThread;
+    bool bIsRunning;
+
+    CRITICAL_SECTION cs_trades;
+    CRITICAL_SECTION cs_log;
+
+    HWND hWnd;
+    char DllPath[MAX_PATH];
+    char LogPath[MAX_PATH];
+
+    std::map<std::string, int> pendingTrades;
+    std::map<int, Trade> openTrades;
+    std::map<long long, int> ctidToZorroId;
+    std::map<int, std::pair<std::string, int>> pendingTradeInfo;
+    int nextTradeId;
+
+    ULONGLONG lastPingMs;
+    ULONGLONG lastRetryProcessMs;
+};
+
+extern GLOBAL G;
+
+constexpr int PLUGIN_TYPE = 2;
+constexpr const char* PLUGIN_NAME = "cTrader";
+constexpr const char* PLUGIN_VERSION = "1.2.1";
+constexpr const char* CTRADER_HOST_DEMO = "demo.ctraderapi.com";
+constexpr const char* CTRADER_HOST_LIVE = "live.ctraderapi.com";
+constexpr const int CTRADER_WS_PORT = 5036;
+constexpr ULONGLONG PING_INTERVAL_MS = 30000;
+
+typedef double DATE;
