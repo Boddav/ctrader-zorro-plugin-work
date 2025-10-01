@@ -1,0 +1,1145 @@
+# main.cpp - TELJES
+
+```cpp
+// ============================================================================
+// main.cpp - TELJES IMPLEMENTÁCIÓ
+// ============================================================================
+
+#include "globals.h"
+#include "network.h"
+#include "auth.h"
+#include "oauth_utils.h"
+#include "reconnect.h"
+#include "symbols.h"
+#include "utils.h"
+#include "csv_loader.h"
+
+// Zorro callbacks
+int(__cdecl* BrokerMessage)(const char* Text) = NULL;
+int(__cdecl* BrokerProgress)(intptr_t Progress) = NULL;
+
+// Global state
+GLOBAL G;
+
+// Forward declarations for symbols.cpp compatibility wrappers
+void showMsg(const char* Text, const char* Detail = "");
+void log_to_wesocket(const char* line1, const char* line2 = nullptr);
+const char* get_msg_id();
+bool body_indicates_error(const char* buffer);
+bool tcp_send(const char* data);
+
+// Wrapper implementations for symbols.cpp
+void showMsg(const char* Text, const char* Detail) { 
+    Utils::ShowMsg(Text, Detail); 
+}
+
+void log_to_wesocket(const char* line1, const char* line2) { 
+    Utils::LogToFile(line1, line2 ? line2 : ""); 
+}
+
+const char* get_msg_id() { 
+    return Utils::GetMsgId(); 
+}
+
+bool body_indicates_error(const char* buffer) { 
+    return Utils::BodyIndicatesError(buffer); 
+}
+
+bool tcp_send(const char* data) { 
+    return Network::Send(data); 
+}
+
+static const char* HostForEnv() {
+    return (G.Env == CtraderEnv::Live) ? CTRADER_HOST_LIVE : CTRADER_HOST_DEMO;
+}
+
+static CtraderEnv DetectEnvFromType(const char* Type) {
+    if (!Type) return CtraderEnv::Demo;
+    if (Utils::StrContainsCaseInsensitive(Type, "live") || 
+        Utils::StrContainsCaseInsensitive(Type, "real")) {
+        return CtraderEnv::Live;
+    }
+    return CtraderEnv::Demo;
+}
+
+// ============================================================================
+// NETWORK THREAD
+// ============================================================================
+
+unsigned __stdcall NetworkThread(void*) {
+    char buffer[32768];
+    
+    while (G.bIsRunning) {
+        ULONGLONG now = GetTickCount64();
+        
+        // Process symbol subscription retries every second
+        if (now - G.lastRetryProcessMs > 1000) {
+            Symbols::ProcessRetries(G.CTraderAccountId);
+            G.lastRetryProcessMs = now;
+        }
+        
+        int bytes = Network::Receive(buffer, sizeof(buffer));
+        
+        // Connection lost
+        if (bytes < 0) {
+            Utils::ShowMsg("Connection lost");
+            if (G.HasLogin && Reconnect::Attempt()) {
+                Utils::ShowMsg("Reconnected");
+                continue;
+            }
+            G.bIsRunning = false;
+            break;
+        }
+        
+        // No data, send heartbeat if needed
+        if (bytes == 0) {
+            if (now - G.lastPingMs >= PING_INTERVAL_MS) {
+                char ping[128];
+                sprintf_s(ping, "{\"payloadType\":2106,\"payload\":{}}");
+                Network::Send(ping);
+                G.lastPingMs = now;
+            }
+            continue;
+        }
+        
+        // Got data, update ping time
+        G.lastPingMs = GetTickCount64();
+        
+        // Parse payload type
+        const char* pType = strstr(buffer, "\"payloadType\":");
+        int payloadType = 0;
+        if (pType) {
+            sscanf_s(pType, "\"payloadType\":%d", &payloadType);
+        }
+        
+        // Handle subscription response (2122)
+        if (payloadType == 2122) {
+            char clientMsgId[64] = {0};
+            const char* pId = strstr(buffer, "\"clientMsgId\":\"");
+            if (pId) {
+                sscanf_s(pId, "\"clientMsgId\":\"%63[^\"]\"", clientMsgId, 
+                        (unsigned)_countof(clientMsgId));
+            }
+            
+            bool success = !Utils::BodyIndicatesError(buffer);
+            std::string error_details = "";
+            
+            if (!success) {
+                const char* pDesc = strstr(buffer, "\"description\":\"");
+                if (pDesc) {
+                    char desc[256] = {0};
+                    sscanf_s(pDesc, "\"description\":\"%255[^\"]\"", desc, 
+                            (unsigned)_countof(desc));
+                    error_details = desc;
+                }
+            }
+            
+            Symbols::HandleSubscriptionResponse(clientMsgId, success, error_details);
+        }
+        // Handle spot event (2126) - quotes or executions
+        else if (payloadType == 2126) {
+            // Check if this is a trade execution
+            if (strstr(buffer, "\"executionType\"")) {
+                char clientMsgId[64] = {0};
+                const char* pId = strstr(buffer, "\"clientMsgId\":\"");
+                if (pId) {
+                    sscanf_s(pId, "\"clientMsgId\":\"%63[^\"]\"", clientMsgId, 
+                            (unsigned)_countof(clientMsgId));
+                }
+                
+                EnterCriticalSection(&G.cs_trades);
+                
+                auto it = G.pendingTrades.find(clientMsgId);
+                if (it != G.pendingTrades.end()) {
+                    int zorroId = it->second;
+                    
+                    const char* pExec = strstr(buffer, "\"executionType\":\"");
+                    if (pExec && (strncmp(pExec + 17, "ORDER_ACCEPTED", 14) == 0 ||
+                                  strncmp(pExec + 17, "ORDER_FILLED", 12) == 0)) {
+                        
+                        Trade newTrade = {};
+                        newTrade.zorroId = zorroId;
+                        
+                        // Extract position ID
+                        const char* pPosId = strstr(buffer, "\"positionId\":");
+                        if (pPosId) {
+                            sscanf_s(pPosId, "\"positionId\":%lld", &newTrade.ctid);
+                        }
+                        
+                        // Extract execution price
+                        const char* pPrice = strstr(buffer, "\"executionPrice\":");
+                        if (pPrice) {
+                            sscanf_s(pPrice, "\"executionPrice\":%lf", &newTrade.openPrice);
+                        }
+                        
+                        // Extract volume
+                        const char* pVol = strstr(buffer, "\"executedVolume\":");
+                        int vol = 0;
+                        if (pVol) {
+                            sscanf_s(pVol, "\"executedVolume\":%d", &vol);
+                        }
+                        
+                        // Get symbol and side from pending info
+                        auto pit = G.pendingTradeInfo.find(zorroId);
+                        if (pit != G.pendingTradeInfo.end()) {
+                            newTrade.symbol = pit->second.first;
+                            int side = pit->second.second;
+                            newTrade.amount = side * (vol != 0 ? vol : 1);
+                            G.pendingTradeInfo.erase(pit);
+                        } else {
+                            newTrade.amount = vol;
+                        }
+                        
+                        G.openTrades[zorroId] = newTrade;
+                        G.ctidToZorroId[newTrade.ctid] = zorroId;
+                    }
+                    
+                    G.pendingTrades.erase(it);
+                }
+                
+                LeaveCriticalSection(&G.cs_trades);
+            }
+            // Quote update
+            else {
+                long long symbolId = 0;
+                const char* pSymId = strstr(buffer, "\"symbolId\":");
+                if (pSymId) {
+                    sscanf_s(pSymId, "\"symbolId\":%lld", &symbolId);
+                }
+                
+                if (symbolId > 0) {
+                    long long bid = 0, ask = 0;
+                    
+                    const char* pBid = strstr(buffer, "\"bid\":");
+                    if (pBid) {
+                        sscanf_s(pBid, "\"bid\":%lld", &bid);
+                    }
+                    
+                    const char* pAsk = strstr(buffer, "\"ask\":");
+                    if (pAsk) {
+                        sscanf_s(pAsk, "\"ask\":%lld", &ask);
+                    }
+                    
+                    Symbols::UpdateQuote(symbolId, bid, ask);
+                }
+            }
+            
+            // Check for position close
+            if (strstr(buffer, "\"positionStatus\":\"POSITION_CLOSED\"")) {
+                const char* pPosId = strstr(buffer, "\"positionId\":");
+                long long pid = 0;
+                if (pPosId) {
+                    sscanf_s(pPosId, "\"positionId\":%lld", &pid);
+                }
+                
+                double profit = 0.0;
+                const char* pProfit = strstr(buffer, "\"profit\":");
+                if (pProfit) {
+                    sscanf_s(pProfit, "\"profit\":%lf", &profit);
+                }
+                
+                EnterCriticalSection(&G.cs_trades);
+                auto zit = G.ctidToZorroId.find(pid);
+                if (zit != G.ctidToZorroId.end()) {
+                    Trade& tr = G.openTrades[zit->second];
+                    tr.closed = true;
+                    tr.profit = profit;
+                    tr.closePrice = 0;
+                }
+                LeaveCriticalSection(&G.cs_trades);
+            }
+        }
+        // Heartbeat response (2106)
+        else if (payloadType == 2106) {
+            char pong[64];
+            sprintf_s(pong, "{\"payloadType\":2106,\"payload\":{}}");
+            Network::Send(pong);
+        }
+    }
+    
+    return 0;
+}
+
+// ============================================================================
+// BROKER API IMPLEMENTATIONS
+// ============================================================================
+
+DLLFUNC int BrokerOpen(char* Name, FARPROC fpError, FARPROC fpProgress) {
+    strcpy_s(G.DllPath, Name);
+    BrokerMessage = (int(__cdecl*)(const char*))fpError;
+    BrokerProgress = (int(__cdecl*)(intptr_t))fpProgress;
+    return PLUGIN_VERSION[0];
+}
+
+DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
+    // Stop existing connection if any
+    if (G.bIsRunning) {
+        G.bIsRunning = false;
+        if (G.hNetworkThread) {
+            WaitForSingleObject(G.hNetworkThread, 2000);
+            CloseHandle(G.hNetworkThread);
+            G.hNetworkThread = NULL;
+        }
+    }
+    
+    Network::Disconnect();
+    ZeroMemory(&G, sizeof(G));
+    Symbols::Cleanup();
+    Symbols::Initialize();
+    
+    G.nextTradeId = 1;
+    
+    // Try to load from CSV
+    CsvCreds cc;
+    if (CsvLoader::LoadAccountsCsv(cc, User, Type)) {
+        strncpy_s(G.ClientId, sizeof(G.ClientId), cc.clientId.c_str(), _TRUNCATE);
+        strncpy_s(G.ClientSecret, sizeof(G.ClientSecret), cc.clientSecret.c_str(), _TRUNCATE);
+        G.CTraderAccountId = _strtoui64(cc.accountId.c_str(), NULL, 10);
+        G.Env = DetectEnvFromType(cc.type.c_str());
+        
+        if (!cc.accessToken.empty()) {
+            strncpy_s(G.Token, sizeof(G.Token), cc.accessToken.c_str(), _TRUNCATE);
+        }
+    } else {
+        // Fallback to parameters
+        strncpy_s(G.ClientId, sizeof(G.ClientId), User ? User : "", _TRUNCATE);
+        strncpy_s(G.ClientSecret, sizeof(G.ClientSecret), Pwd ? Pwd : "", _TRUNCATE);
+        G.Env = DetectEnvFromType(Type);
+        
+        if (Accounts && *Accounts) {
+            G.CTraderAccountId = _strtoui64(Accounts, NULL, 10);
+        }
+    }
+    
+    G.HasLogin = true;
+    
+    // Try to load token from disk
+    if (G.Token[0] == '\0') {
+        if (Auth::LoadTokenFromDisk()) {
+            Utils::ShowMsg("Token loaded from disk");
+        }
+    }
+    
+    // If still no token, perform OAuth flow
+    if (G.Token[0] == '\0') {
+        Utils::ShowMsg("No token found, starting OAuth flow...");
+        
+        if (!G.ClientId[0] || !G.ClientSecret[0]) {
+            Utils::ShowMsg("Error: Client ID/Secret missing");
+            return 0;
+        }
+        
+        if (!OAuth::PerformInteractiveFlow()) {
+            Utils::ShowMsg("OAuth flow failed");
+            return 0;
+        }
+    }
+    
+    // Connect to cTrader
+    const char* host = HostForEnv();
+    char msg[256];
+    sprintf_s(msg, "Connecting to: %s", host);
+    Utils::ShowMsg(msg);
+    
+    if (!Network::Connect(host, "5036")) {
+        Utils::ShowMsg("Connection failed");
+        return 0;
+    }
+    
+    // Application authentication (payloadType 2100)
+    char request[1024] = {0};
+    char response[16384] = {0};
+    
+    sprintf_s(request,
+        "{\"clientMsgId\":\"%s\",\"payloadType\":2100,\"payload\":{\"clientId\":\"%s\",\"clientSecret\":\"%s\"}}",
+        Utils::GetMsgId(), G.ClientId, G.ClientSecret);
+    
+    if (!Network::Send(request)) {
+        Utils::ShowMsg("App auth send failed");
+        return 0;
+    }
+    
+    if (Network::Receive(response, sizeof(response)) <= 0) {
+        Utils::ShowMsg("App auth response failed");
+        return 0;
+    }
+    
+    if (!strstr(response, "\"payloadType\":2101")) {
+        Utils::ShowMsg("App auth failed");
+        Utils::LogToFile("APP_AUTH_RESPONSE", response);
+        return 0;
+    }
+    
+    Utils::ShowMsg("App authenticated");
+    
+    // Auto-detect account if not specified
+    if (G.CTraderAccountId == 0) {
+        Utils::ShowMsg("Auto-detecting account...");
+        std::vector<long long> accountIds;
+        
+        if (Auth::FetchAccountsList(accountIds)) {
+            G.CTraderAccountId = accountIds[0];
+            char accMsg[128];
+            sprintf_s(accMsg, "Account detected: %lld", G.CTraderAccountId);
+            Utils::ShowMsg(accMsg);
+        } else {
+            Utils::ShowMsg("Account detection failed");
+            return 0;
+        }
+    }
+    
+    // Account authentication helper
+    auto TryAccountAuth = [&](long long acctId)->bool {
+        char locReq[1024] = {0};
+        char locRes[16384] = {0};
+        
+        sprintf_s(locReq,
+            "{\"clientMsgId\":\"%s\",\"payloadType\":2102,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld}}",
+            Utils::GetMsgId(), G.Token, acctId);
+        
+        if (!Network::Send(locReq)) return false;
+        if (Network::Receive(locRes, sizeof(locRes)) <= 0) return false;
+        if (!strstr(locRes, "\"payloadType\":2103")) return false;
+        
+        const char* pAcct = strstr(locRes, "\"ctidTraderAccountId\":");
+        long long parsed = 0;
+        if (pAcct) {
+            sscanf_s(pAcct, "\"ctidTraderAccountId\":%lld", &parsed);
+        }
+        if (parsed > 0) {
+            G.CTraderAccountId = parsed;
+        }
+        
+        return true;
+    };
+    
+    // Try account auth, refresh token if needed
+    if (!TryAccountAuth(G.CTraderAccountId)) {
+        Utils::ShowMsg("Account auth failed, trying token refresh...");
+        
+        if (Auth::RefreshAccessToken() && TryAccountAuth(G.CTraderAccountId)) {
+            Utils::ShowMsg("Authenticated with refreshed token");
+        } else {
+            Utils::ShowMsg("Error: Account auth failed");
+            return 0;
+        }
+    } else {
+        Utils::ShowMsg("Account authenticated");
+    }
+    
+    // Fetch symbols (payloadType 2114)
+    Utils::ShowMsg("Fetching symbols...");
+    
+    ZeroMemory(request, sizeof(request));
+    ZeroMemory(response, sizeof(response));
+    
+    sprintf_s(request,
+        "{\"clientMsgId\":\"%s\",\"payloadType\":2114,\"payload\":{\"ctidTraderAccountId\":%lld}}",
+        Utils::GetMsgId(), G.CTraderAccountId);
+    
+    if (!Network::Send(request)) {
+        Utils::ShowMsg("Symbol request failed");
+        return 0;
+    }
+    
+    if (Network::Receive(response, sizeof(response)) <= 0) {
+        Utils::ShowMsg("Symbol response failed");
+        return 0;
+    }
+    
+    if (!strstr(response, "\"payloadType\":2115")) {
+        Utils::ShowMsg("Symbol fetch failed");
+        return 0;
+    }
+    
+    Utils::LogToFile("SYMBOLS_RESPONSE", response);
+    
+    // Parse symbols
+    const char* pSymbol = strstr(response, "\"symbols\":[");
+    if (!pSymbol) pSymbol = strstr(response, "\"symbol\":[");
+    
+    int count = 0;
+    if (pSymbol) {
+        pSymbol += strlen(pSymbol == strstr(response, "\"symbols\":[") ? 
+                         "\"symbols\":[" : "\"symbol\":[");
+        const char* pEnd = strstr(pSymbol, "]");
+        
+        if (pEnd) {
+            std::string all_symbols(pSymbol, pEnd - pSymbol);
+            const char* current = all_symbols.c_str();
+            
+            while ((current = strstr(current, "{"))) {
+                long long id = 0;
+                int digits = 5;
+                char symbolName[64] = {0};
+                
+                const char* pId = strstr(current, "\"symbolId\":");
+                if (pId) {
+                    sscanf_s(pId, "\"symbolId\":%lld", &id);
+                }
+                
+                const char* pName = strstr(current, "\"symbolName\":\"");
+                if (pName) {
+                    sscanf_s(pName, "\"symbolName\":\"%63[^\"]\"", symbolName, 
+                            (unsigned)_countof(symbolName));
+                }
+                
+                const char* pDigits = strstr(current, "\"digits\":");
+                if (pDigits) {
+                    sscanf_s(pDigits, "\"digits\":%d", &digits);
+                }
+                
+                if (id > 0 && strlen(symbolName) > 0) {
+                    Symbols::AddSymbol(symbolName, id, digits);
+                    count++;
+                }
+                
+                current++;
+            }
+        }
+    }
+    
+    sprintf_s(msg, "Loaded %d symbols", count);
+    Utils::ShowMsg(msg);
+    
+    // Generate AssetList file
+    Symbols::GenerateBrokerAssetsFile(G.DllPath);
+    
+    // Start network thread
+    G.bIsRunning = true;
+    G.lastPingMs = GetTickCount64();
+    G.lastRetryProcessMs = GetTickCount64();
+    
+    G.hNetworkThread = (HANDLE)_beginthreadex(NULL, 0, &NetworkThread, NULL, 0, NULL);
+    if (!G.hNetworkThread) {
+        G.bIsRunning = false;
+        Utils::ShowMsg("Thread creation failed");
+        return 0;
+    }
+    
+    Utils::ShowMsg("Login successful");
+    return 1;
+}
+
+DLLFUNC void BrokerClose() {
+    if (G.bIsRunning) {
+        G.bIsRunning = false;
+        if (G.hNetworkThread) {
+            WaitForSingleObject(G.hNetworkThread, 2000);
+            CloseHandle(G.hNetworkThread);
+            G.hNetworkThread = NULL;
+        }
+    }
+    Network::Disconnect();
+}
+
+DLLFUNC int BrokerBuy2(char* Symbol, int nAmount, double dStopDist, double dLimit, 
+                       double* pPrice, int* pFill) {
+    if (G.CTraderAccountId == 0 || !Symbol) return 0;
+    
+    SymbolInfo* info = Symbols::GetSymbol(Symbol);
+    if (!info) {
+        char msg[128];
+        sprintf_s(msg, "Symbol not found: %s", Symbol);
+        Utils::ShowMsg(msg);
+        return 0;
+    }
+    
+    long long symbolId = info->id;
+    int tradeSide = (nAmount > 0) ? 1 : 2; // 1=BUY, 2=SELL
+    long long volumeInCents = (long long)abs(nAmount) * 100000;
+    
+    std::string clientMsgId = Utils::GetMsgId();
+    int zorroTradeId = G.nextTradeId++;
+    
+    // Store pending trade
+    EnterCriticalSection(&G.cs_trades);
+    G.pendingTrades[clientMsgId] = zorroTradeId;
+    G.pendingTradeInfo[zorroTradeId] = std::make_pair(std::string(Symbol), 
+                                                       (nAmount > 0 ? 1 : -1));
+    LeaveCriticalSection(&G.cs_trades);
+    
+    // Send order (payloadType 2105)
+    char request[1024];
+    sprintf_s(request,
+        "{\"clientMsgId\":\"%s\",\"payloadType\":2105,\"payload\":"
+        "{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld,"
+        "\"symbolId\":%lld,\"orderType\":1,\"tradeSide\":%d,\"volume\":%lld}}",
+        clientMsgId.c_str(), G.Token, G.CTraderAccountId, symbolId, 
+        tradeSide, volumeInCents);
+    
+    if (!Network::Send(request)) {
+        EnterCriticalSection(&G.cs_trades);
+        G.pendingTrades.erase(clientMsgId);
+        G.pendingTradeInfo.erase(zorroTradeId);
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::ShowMsg("Order send failed");
+        return 0;
+    }
+    
+    if (pFill) *pFill = nAmount;
+    if (pPrice) *pPrice = 0;
+    
+    return zorroTradeId;
+}
+
+DLLFUNC int BrokerBuy(char* Symbol, int nAmount, double dStopDist, double* pPrice) {
+    return BrokerBuy2(Symbol, nAmount, dStopDist, 0, pPrice, nullptr);
+}
+
+DLLFUNC int BrokerAsset(char* Symbol, double* pPrice, double* pSpread, 
+                        double* pVolume, double* pPip, double* pPipCost, 
+                        double* pLotAmount, double* pMarginCost, 
+                        double* pRollLong, double* pRollShort) {
+    if (!Symbol) return 0;
+    
+    SymbolInfo* info = Symbols::GetSymbol(Symbol);
+    if (!info) return 0;
+    
+    // Ensure subscribed to get quotes
+    Symbols::EnsureSubscribed(G.CTraderAccountId, Symbol);
+    
+    Symbols::Lock();
+    
+    double d_bid = 0, d_ask = 0;
+    if (info->bid > 0 && info->ask > 0) {
+        d_bid = (double)info->bid / pow(10, info->digits);
+        d_ask = (double)info->ask / pow(10, info->digits);
+    }
+    int digits = info->digits;
+    
+    Symbols::Unlock();
+    
+    if (pPrice) {
+        *pPrice = (d_bid > 0 && d_ask > 0) ? (d_bid + d_ask) / 2.0 : 0;
+    }
+    
+    if (pSpread) {
+        *pSpread = (d_bid > 0 && d_ask > 0) ? (d_ask - d_bid) : 0;
+    }
+    
+    if (pPip) {
+        *pPip = 1.0 / pow(10, digits);
+    }
+    
+    if (pVolume) *pVolume = 0;
+    if (pPipCost) *pPipCost = 0;
+    if (pLotAmount) *pLotAmount = 0;
+    if (pMarginCost) *pMarginCost = 0;
+    if (pRollLong) *pRollLong = 0;
+    if (pRollShort) *pRollShort = 0;
+    
+    return 1;
+}
+
+DLLFUNC int BrokerTime(DATE* pTime) {
+    if (pTime) {
+        SYSTEMTIME st;
+        GetSystemTime(&st);
+        SystemTimeToVariantTime(&st, pTime);
+    }
+    return 1;
+}
+
+DLLFUNC int BrokerSell(int nTradeID, int nAmount) {
+    EnterCriticalSection(&G.cs_trades);
+    
+    auto it = G.openTrades.find(nTradeID);
+    if (it == G.openTrades.end()) {
+        LeaveCriticalSection(&G.cs_trades);
+        return 0;
+    }
+    
+    Trade& t = it->second;
+    long long ctid = t.ctid;
+    
+    LeaveCriticalSection(&G.cs_trades);
+    
+    long long volumeInCents = (long long)((nAmount != 0 ? abs(nAmount) : abs(t.amount)) * 100000ll);
+    
+    // Close position (payloadType 2108)
+    char request[512];
+    sprintf_s(request,
+        "{\"clientMsgId\":\"%s\",\"payloadType\":2108,\"payload\":"
+        "{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld,"
+        "\"positionId\":%lld,\"volume\":%lld}}",
+        Utils::GetMsgId(), G.Token, G.CTraderAccountId, ctid, volumeInCents);
+    
+    if (!Network::Send(request)) {
+        Utils::ShowMsg("Close position failed");
+        return 0;
+    }
+    
+    return 1;
+}
+
+DLLFUNC int BrokerSell2(int nTradeID, int nAmount, double Limit) {
+    return BrokerSell(nTradeID, nAmount);
+}
+
+DLLFUNC int BrokerTrade(int nTradeID, double* pOpen, double* pClose, 
+                        double* pRoll, double* pProfit) {
+    EnterCriticalSection(&G.cs_trades);
+    
+    auto it = G.openTrades.find(nTradeID);
+    if (it == G.openTrades.end()) {
+        LeaveCriticalSection(&G.cs_trades);
+        return 0;
+    }
+    
+    Trade t = it->second;
+    
+    LeaveCriticalSection(&G.cs_trades);
+    
+    if (pOpen) *pOpen = t.openPrice;
+    if (pClose) *pClose = t.closed ? t.closePrice : 0;
+    if (pRoll) *pRoll = t.swap;
+    if (pProfit) *pProfit = t.profit;
+    
+    return 1;
+}
+
+DLLFUNC int BrokerAccount(char* Account, double* pBalance, double* pTradeVal, 
+                         double* pMarginVal) {
+    if (pBalance) *pBalance = 10000.0; // Stub
+    if (pTradeVal) *pTradeVal = 0.0;
+    if (pMarginVal) *pMarginVal = 0.0;
+    if (Account) strcpy_s(Account, 1024, "cTrader");
+    return 1;
+}
+
+DLLFUNC int BrokerAccount2(char* Account, double* pBalance, double* pTradeVal,
+                          double* pMargin, double* pMarginVal, double* pEquity) {
+    if (pBalance) *pBalance = 10000.0;
+    if (pTradeVal) *pTradeVal = 0.0;
+    if (pMargin) *pMargin = 0.0;
+    if (pMarginVal) *pMarginVal = 0.0;
+    if (pEquity) *pEquity = 10000.0;
+    if (Account) strcpy_s(Account, 1024, "cTrader");
+    return 1;
+}
+
+DLLFUNC double BrokerCommand(int Mode, intptr_t p) {
+    if (Mode == 138) { // SET_DIAGNOSTICS
+        G.Diag = (int)p;
+    }
+    return 0;
+}
+
+DLLFUNC char* BrokerRequest(const char* Url, const char* Data, const char* Headers) {
+    return NULL; // Not implemented
+}
+
+DLLFUNC int BrokerLogout(void) {
+    return 1;
+}
+
+DLLFUNC int BrokerHistory(char* Symbol, DATE tStart, DATE tEnd,
+                         int nTickMinutes, int nTicks, T6* ticks) {
+    Utils::ShowMsg("BrokerHistory: Not implemented");
+    return 0;
+}
+
+DLLFUNC int BrokerHistory2(char* Symbol, DATE tStart, DATE tEnd,
+                          int nTickMinutes, int nTicks, T6* ticks) {
+    return BrokerHistory(Symbol, tStart, tEnd, nTickMinutes, nTicks, ticks);
+}
+
+// ============================================================================
+// DLL ENTRY POINT
+// ============================================================================
+
+BOOL APIENTRY DllMain(HANDLE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        Symbols::Initialize();
+        
+        InitializeCriticalSection(&G.cs_trades);
+        InitializeCriticalSection(&G.cs_log);
+        
+        GetModuleFileNameA((HMODULE)hModule, G.DllPath, MAX_PATH);
+        char* pLastSlash = strrchr(G.DllPath, '\\');
+        if (pLastSlash) {
+            *(pLastSlash + 1) = '\0';
+        }
+        
+        strcpy_s(G.LogPath, G.DllPath);
+        strcat_s(G.LogPath, "ctrader.log");
+        
+        strcpy_s(G.Scope, "trading");
+        strcpy_s(G.Product, "web");
+        
+        WSADATA wsaData;
+        WSAStartup(MAKEWORD(2, 2), &wsaData);
+    }
+    else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
+        BrokerClose();
+        Symbols::Cleanup();
+        
+        DeleteCriticalSection(&G.cs_trades);
+        DeleteCriticalSection(&G.cs_log);
+        
+        WSACleanup();
+    }
+    
+    return TRUE;
+}
+```
+
+---
+
+# symbols.cpp - TELJES (a PDF-ből)
+
+```cpp
+// ============================================================================
+// symbols.cpp - TELJES IMPLEMENTÁCIÓ
+// ============================================================================
+
+#include "symbols.h"
+#include "globals.h"
+#include <map>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <algorithm>
+#include <ctime>
+
+// External functions (provided by main.cpp)
+extern void showMsg(const char* Text, const char* Detail);
+extern void log_to_wesocket(const char* line1, const char* line2);
+extern const char* get_msg_id();
+extern bool tcp_send(const char* data);
+extern bool body_indicates_error(const char* buffer);
+
+namespace {
+    std::map<std::string, SymbolInfo> g_symbols;
+    std::map<long long, std::string> g_symbolById;
+    std::map<std::string, std::string> g_pendingSubscriptions;
+    CRITICAL_SECTION g_cs_symbols;
+    
+    constexpr int MAX_RETRY_COUNT = 3;
+    constexpr int64_t RETRY_DELAYS[] = {5000, 15000, 30000};
+    
+    std::vector<std::string> split_csv_line(const std::string& line) {
+        std::vector<std::string> result;
+        std::string current;
+        bool in_quotes = false;
+        
+        for (char c : line) {
+            if (c == '"') {
+                in_quotes = !in_quotes;
+            } else if (c == ',' && !in_quotes) {
+                result.push_back(current);
+                current.clear();
+            } else {
+                current.push_back(c);
+            }
+        }
+        result.push_back(current);
+        return result;
+    }
+    
+    void send_subscription_request(long long accountId, const std::string& symbolName) {
+        auto it = g_symbols.find(symbolName);
+        if (it == g_symbols.end()) return;
+        
+        long long symbolId = it->second.id;
+        std::string clientMsgId = get_msg_id();
+        
+        g_pendingSubscriptions[clientMsgId] = symbolName;
+        
+        char request[512];
+        sprintf_s(request,
+            "{\"clientMsgId\":\"%s\",\"payloadType\":2121,\"payload\":"
+            "{\"ctidTraderAccountId\":%lld,\"symbolId\":[%lld]}}",
+            clientMsgId.c_str(), accountId, symbolId);
+        
+        if (!tcp_send(request)) {
+            g_pendingSubscriptions.erase(clientMsgId);
+        }
+    }
+}
+
+namespace Symbols {
+
+void Initialize() {
+    InitializeCriticalSection(&g_cs_symbols);
+    g_symbols.clear();
+    g_symbolById.clear();
+    g_pendingSubscriptions.clear();
+}
+
+void Cleanup() {
+    Lock();
+    g_symbols.clear();
+    g_symbolById.clear();
+    g_pendingSubscriptions.clear();
+    Unlock();
+    DeleteCriticalSection(&g_cs_symbols);
+}
+
+void Lock() {
+    EnterCriticalSection(&g_cs_symbols);
+}
+
+void Unlock() {
+    LeaveCriticalSection(&g_cs_symbols);
+}
+
+void AddSymbol(const std::string& name, long long id, int digits) {
+    Lock();
+    
+    SymbolInfo info = {};
+    info.id = id;
+    info.digits = digits;
+    info.subscribed = false;
+    info.bid = 0;
+    info.ask = 0;
+    info.retry_count = 0;
+    info.last_retry_time = 0;
+    
+    g_symbols[name] = info;
+    g_symbolById[id] = name;
+    
+    Unlock();
+}
+
+SymbolInfo* GetSymbol(const std::string& symbolName) {
+    Lock();
+    auto it = g_symbols.find(symbolName);
+    if (it != g_symbols.end()) {
+        Unlock();
+        return &it->second;
+    }
+    Unlock();
+    return nullptr;
+}
+
+bool EnsureSubscribed(long long ctidTraderAccountId, const std::string& symbolName) {
+    Lock();
+    
+    auto it = g_symbols.find(symbolName);
+    if (it == g_symbols.end()) {
+        Unlock();
+        return false;
+    }
+    
+    if (it->second.subscribed) {
+        Unlock();
+        return true;
+    }
+    
+    if (it->second.retry_count >= MAX_RETRY_COUNT) {
+        Unlock();
+        return false;
+    }
+    
+    int64_t now = (int64_t)time(nullptr) * 1000;
+    int64_t delay = (it->second.retry_count > 0) ? 
+                    RETRY_DELAYS[it->second.retry_count - 1] : 0;
+    
+    if (now - it->second.last_retry_time < delay) {
+        Unlock();
+        return false;
+    }
+    
+    it->second.last_retry_time = now;
+    it->second.retry_count++;
+    
+    Unlock();
+    
+    send_subscription_request(ctidTraderAccountId, symbolName);
+    return false;
+}
+
+void UpdateQuote(long long symbolId, long long bid, long long ask) {
+    Lock();
+    
+    auto idIt = g_symbolById.find(symbolId);
+    if (idIt == g_symbolById.end()) {
+        Unlock();
+        return;
+    }
+    
+    std::string name = idIt->second;
+    auto it = g_symbols.find(name);
+    if (it != g_symbols.end()) {
+        it->second.bid = bid;
+        it->second.ask = ask;
+        
+        if (!it->second.subscribed) {
+            it->second.subscribed = true;
+            it->second.retry_count = 0;
+        }
+    }
+    
+    Unlock();
+}
+
+void BatchResubscribe(long long ctidTraderAccountId) {
+    Lock();
+    
+    std::vector<long long> symbolIds;
+    for (const auto& kv : g_symbols) {
+        if (kv.second.subscribed) {
+            symbolIds.push_back(kv.second.id);
+        }
+    }
+    
+    Unlock();
+    
+    if (symbolIds.empty()) return;
+    
+    const size_t BATCH_SIZE = 50;
+    for (size_t i = 0; i < symbolIds.size(); i += BATCH_SIZE) {
+        size_t end = (i + BATCH_SIZE < symbolIds.size()) ? 
+                     i + BATCH_SIZE : symbolIds.size();
+        
+        std::string ids;
+        for (size_t j = i; j < end; ++j) {
+            if (j > i) ids += ",";
+            char buf[32];
+            sprintf_s(buf, "%lld", symbolIds[j]);
+            ids += buf;
+        }
+        
+        char request[2048];
+        sprintf_s(request,
+            "{\"clientMsgId\":\"%s\",\"payloadType\":2121,\"payload\":"
+            "{\"ctidTraderAccountId\":%lld,\"symbolId\":[%s]}}",
+            get_msg_id(), ctidTraderAccountId, ids.c_str());
+        
+        tcp_send(request);
+    }
+}
+
+void HandleSubscriptionResponse(const std::string& clientMsgId, bool success, 
+                               const std::string& error_details) {
+    Lock();
+    
+    auto pit = g_pendingSubscriptions.find(clientMsgId);
+    if (pit == g_pendingSubscriptions.end()) {
+        Unlock();
+        return;
+    }
+    
+    std::string symbolName = pit->second;
+    g_pendingSubscriptions.erase(pit);
+    
+    auto it = g_symbols.find(symbolName);
+    if (it == g_symbols.end()) {
+        Unlock();
+        return;
+    }
+    
+    if (success) {
+        it->second.subscribed = true;
+        it->second.retry_count = 0;
+    } else {
+        char msg[256];
+        sprintf_s(msg, "Subscription failed: %s - %s", 
+                 symbolName.c_str(), error_details.c_str());
+        log_to_wesocket("SUBSCRIPTION_ERROR", msg);
+    }
+    
+    Unlock();
+}
+
+void ProcessRetries(long long ctidTraderAccountId) {
+    Lock();
+    
+    std::vector<std::string> toRetry;
+    int64_t now = (int64_t)time(nullptr) * 1000;
+    
+    for (auto& kv : g_symbols) {
+        if (!kv.second.subscribed && 
+            kv.second.retry_count > 0 && 
+            kv.second.retry_count < MAX_RETRY_COUNT) {
+            
+            int64_t delay = RETRY_DELAYS[kv.second.retry_count - 1];
+            if (now - kv.second.last_retry_time >= delay) {
+                toRetry.push_back(kv.first);
+            }
+        }
+    }
+    
+    Unlock();
+    
+    for (const auto& name : toRetry) {
+        EnsureSubscribed(ctidTraderAccountId, name);
+    }
+}
+
+void GenerateBrokerAssetsFile(const char* dllPath) {
+    char assetFixPath[MAX_PATH];
+    sprintf_s(assetFixPath, "%sAssetFix.csv", dllPath);
+    
+    std::ifstream inFile(assetFixPath);
+    if (!inFile.is_open()) {
+        log_to_wesocket("ASSET_GEN", "AssetFix.csv not found, skipping");
+        return;
+    }
+    
+    std::map<std::string, std::string> mapping;
+    std::string line;
+    
+    while (std::getline(inFile, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
+        auto parts = split_csv_line(line);
+        if (parts.size() >= 2) {
+            std::string key = parts[0];
+            std::string value = parts[1];
+            
+            key.erase(std::remove(key.begin(), key.end(), ' '), key.end());
+            key.erase(std::remove(key.begin(), key.end(), '\t'), key.end());
+            key.erase(std::remove(key.begin(), key.end(), '\r'), key.end());
+            
+            value.erase(std::remove(value.begin(), value.end(), ' '), value.end());
+            value.erase(std::remove(value.begin(), value.end(), '\t'), value.end());
+            value.erase(std::remove(value.begin(), value.end(), '\r'), value.end());
+            
+            if (!key.empty() && !value.empty()) {
+                mapping[key] = value;
+            }
+        }
+    }
+    inFile.close();
+    
+    char assetListPath[MAX_PATH];
+    sprintf_s(assetListPath, "%sAssetList.txt", dllPath);
+    
+    std::ofstream outFile(assetListPath);
+    if (!outFile.is_open()) {
+        log_to_wesocket("ASSET_GEN", "Cannot create AssetList.txt");
+        return;
+    }
+    
+    Lock();
+    for (const auto& kv : g_symbols) {
+        std::string originalName = kv.first;
+        std::string outputName = originalName;
+        
+        auto mit = mapping.find(originalName);
+        if (mit != mapping.end()) {
+            outputName = mit->second;
+        }
+        
+        outFile << outputName << "\n";
+    }
+    Unlock();
+    
+    outFile.close();
+    
+    char msg[256];
+    sprintf_s(msg, "AssetList.txt generated (%zu symbols)", g_symbols.size());
+    log_to_wesocket("ASSET_GEN", msg);
+}
+
+} // namespace Symbols
+```
+
+---
+
+# KÉSZ
+
+Most már MINDEN kód megvan TXT formában. Másold ki és mentsd el a megfelelő fájlnevekkel!

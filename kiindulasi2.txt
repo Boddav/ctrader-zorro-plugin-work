@@ -1,0 +1,812 @@
+#include "stdafx.h"
+// cTrader API plugin for Zorro
+// Uses a WebSocket (wss) connection and JSON messages.
+
+#include "zorro.h"
+
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <oleauto.h>
+#include <process.h>
+#include <shellapi.h>
+#include <winhttp.h>
+
+// Undefine potential min/max macros from Windows headers/PCH
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+
+#include <string>
+#include <vector>
+#include <map>
+#include <sstream>
+#include <fstream>
+#include <cmath>
+#include <iostream>
+#include <algorithm>
+#include <cctype>
+
+#undef string
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winhttp.lib")
+
+constexpr int       PLUGIN_TYPE = 2;
+constexpr const char* PLUGIN_NAME = "cTrader";
+constexpr const char* PLUGIN_VERSION = "1.0.0";
+
+// cTrader Open API WebSocket endpoints (JSON on 5036)
+constexpr const char* CTRADER_HOST_DEMO = "demo.ctraderapi.com";
+constexpr const char* CTRADER_HOST_LIVE = "live.ctraderapi.com";
+constexpr const int   CTRADER_WS_PORT   = 5036; // JSON
+constexpr ULONGLONG   PING_INTERVAL_MS = 30000; // 30s keepalive
+
+// OAuth2 loopback constants
+constexpr int OAUTH_LISTEN_PORT = 53123;
+constexpr const char* OAUTH_REDIRECT_URI = "http://127.0.0.1:53123/callback";
+constexpr const char* OAUTH_GRANT_URL = "https://id.ctrader.com/my/settings/openapi/grantingaccess/";
+constexpr const wchar_t* OAUTH_TOKEN_HOST = L"openapi.ctrader.com";
+constexpr const wchar_t* OAUTH_TOKEN_PATH = L"/apps/token";
+
+// Global pointers from Zorro
+int(__cdecl* BrokerMessage)(const char* Text) = NULL;
+int(__cdecl* BrokerProgress)(intptr_t Progress) = NULL;
+
+enum class CtraderEnv { Demo, Live };
+
+// --- structs ---
+struct SymbolInfo { long long id; int digits; bool subscribed; long long bid; long long ask; };
+struct Trade { int zorroId; long long ctid; std::string symbol; int amount; double openPrice; double closePrice; long long openTime; long long closeTime; double profit; double commission; double swap; bool closed; };
+struct CsvCreds { std::string clientId; std::string clientSecret; std::string type; std::string accountId; std::string accessToken; };
+
+struct GLOBAL {
+    // session
+    char Token[2048]; char RefreshToken[2048]; int Diag; long long CTraderAccountId;
+    CtraderEnv Env; char ClientId[256]; char ClientSecret[256]; char RedirectUri[512]; char Scope[128]; char Product[64]; bool HasLogin;
+    // WebSocket handles
+    HINTERNET hSession; HINTERNET hConnect; HINTERNET hWebSocket; bool wsConnected;
+    // symbols and trades
+    std::map<std::string, SymbolInfo> Symbols;
+    HANDLE hNetworkThread; bool bIsRunning;
+    CRITICAL_SECTION cs_symbols, cs_trades; CRITICAL_SECTION cs_log;
+    HWND hWnd; char DllPath[MAX_PATH]; char LogPath[MAX_PATH];
+    std::map<std::string, int> pendingTrades; // clientMsgId -> zorroId
+    std::map<int, Trade> openTrades;          // zorroId    -> Trade
+    std::map<long long, int> ctidToZorroId;   // positionId -> zorroId
+    std::map<int, std::pair<std::string,int>> pendingTradeInfo; // zorroId -> (symbol, side)
+    int nextTradeId; ULONGLONG lastPingMs;
+} G;
+
+// Forward declarations
+static bool try_load_accounts_csv(struct CsvCreds& out, const char* hintAccountOrUser, const char* typeHint);
+static bool oauth_listen_for_code(std::string& out_code, int port = OAUTH_LISTEN_PORT, DWORD timeoutMs = 60000);
+static bool winhttp_post_form(const std::wstring& host, const std::wstring& path, const std::string& formData, std::string& outBody);
+static bool save_tokens_to_disk(const std::string& access, const std::string& refresh);
+static bool parse_json_token_fields(const std::string& body, std::string& access, std::string& refresh);
+static bool exchange_code_for_tokens(const std::string& code, const std::string& clientId, const std::string& clientSecret, std::string& accessOut, std::string& refreshOut);
+static bool refresh_access_token();
+static bool perform_interactive_oauth_flow();
+
+static const char* host_for_env();
+bool tcp_connect(const char* host, const char* port);
+void tcp_disconnect();
+bool tcp_send(const char* data);
+int  tcp_recv(char* buffer, int len);
+static bool authenticate_after_connect();
+static void resubscribe_symbols();
+static bool attempt_reconnect(int maxRetries = 3);
+unsigned __stdcall NetworkThread(void*);
+
+DLLFUNC void BrokerClose();
+DLLFUNC int  BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts);
+
+// --- helpers ---
+static void ascii_tolower_inplace(std::string& s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 'A' && c <= 'Z') s[i] = (char)(c + 32);
+    }
+}
+
+static bool str_contains_ci(const char* haystack, const char* needle) {
+    if (!haystack || !needle) return false;
+    std::string h(haystack), n(needle);
+    ascii_tolower_inplace(h);
+    ascii_tolower_inplace(n);
+    return h.find(n) != std::string::npos;
+}
+
+static CtraderEnv detect_env_from_type(const char* Type) {
+    if (str_contains_ci(Type, "live") || str_contains_ci(Type, "real")) return CtraderEnv::Live;
+    if (str_contains_ci(Type, "demo")) return CtraderEnv::Demo;
+    return CtraderEnv::Demo;
+}
+
+static void log_to_file(const char* msg) {
+    if (!msg || !*msg) return;
+    EnterCriticalSection(&G.cs_log);
+    std::ofstream lf(G.LogPath, std::ios::out | std::ios::app);
+    if (lf.is_open()) { lf << msg << "\n"; }
+    lf.close();
+    LeaveCriticalSection(&G.cs_log);
+}
+
+static void log_to_wesocket(const char* line1, const char* line2 = nullptr) {
+    char path[MAX_PATH] = {0};
+    // Use plugin directory if available
+    if (G.DllPath[0]) sprintf_s(path, "%swesocket.txt", G.DllPath);
+    else strcpy_s(path, "wesocket.txt");
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "a") != 0 || !f) return;
+    // Timestamp
+    time_t t = time(nullptr); struct tm tmv; localtime_s(&tmv, &t);
+    char ts[64]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+    fprintf(f, "[%s] %s\n", ts, line1 ? line1 : "");
+    if (line2 && *line2) fprintf(f, "%s\n", line2);
+    fclose(f);
+}
+
+const char* get_msg_id() {
+    static int id = 0;
+    static char buffer[32];
+    sprintf_s(buffer, "msg_%d", ++id);
+    return buffer;
+}
+
+void showMsg(const char* Text, const char* Detail = "") {
+    static char Msg[4096];
+    if (Detail && *Detail) sprintf_s(Msg, "%s %s", Text, Detail);
+    else strcpy_s(Msg, sizeof(Msg), Text);
+    log_to_file(Msg);
+    if (BrokerMessage) BrokerMessage(Msg);
+}
+
+// URL encode minimal
+static std::string url_encode(const std::string& s) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string out; out.reserve(s.size()*3);
+    for (unsigned char c : s) {
+        if ((c >= 'a' && c <= 'z') || (c>='A'&&c<='Z') || (c>='0'&&c<='9') || c=='-'||c=='_'||c=='.'||c=='~') out.push_back(c);
+        else { out.push_back('%'); out.push_back(hex[c>>4]); out.push_back(hex[c&15]); }
+    }
+    return out;
+}
+
+// Minimal local HTTP listener to capture ?code=...
+static bool oauth_listen_for_code(std::string& out_code, int port, DWORD timeoutMs) {
+    SOCKET s = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    out_code.clear();
+    bool ok = false;
+    do {
+        s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) break;
+        sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons((u_short)port);
+        if (bind(s, (sockaddr*)&addr, sizeof(addr)) != 0) break;
+        if (listen(s, 1) != 0) break;
+        // wait for client with timeout
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(s, &rfds);
+        timeval tv; tv.tv_sec = timeoutMs/1000; tv.tv_usec = (timeoutMs%1000)*1000;
+        int r = select(0, &rfds, NULL, NULL, &tv);
+        if (r <= 0) break;
+        client = accept(s, NULL, NULL);
+        if (client == INVALID_SOCKET) break;
+        char buf[2048]; int n = recv(client, buf, sizeof(buf)-1, 0);
+        if (n <= 0) break; buf[n] = 0;
+        // Parse first line: GET /callback?code=... HTTP/1.1
+        const char* p = strstr(buf, "GET "); if (!p) p = buf;
+        const char* q = strstr(p, "\r\n"); std::string firstLine = q ? std::string(p, q-p) : std::string(p);
+        size_t qs = firstLine.find('?'); if (qs != std::string::npos) {
+            std::string query = firstLine.substr(qs+1);
+            size_t sp = query.find(' '); if (sp != std::string::npos) query = query.substr(0, sp);
+            size_t cp = query.find("code="); if (cp != std::string::npos) {
+                size_t amp = query.find('&', cp);
+                std::string codeVal = (amp==std::string::npos) ? query.substr(cp+5) : query.substr(cp+5, amp-(cp+5));
+                out_code = codeVal; ok = true;
+            }
+        }
+        const char* resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n"
+                           "<html><body><h2>Authorization complete.</h2>You can close this window.</body></html>";
+        send(client, resp, (int)strlen(resp), 0);
+    } while(false);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (s != INVALID_SOCKET) closesocket(s);
+    return ok;
+}
+
+static bool winhttp_post_form(const std::wstring& host, const std::wstring& path, const std::string& formData, std::string& outBody) {
+    outBody.clear();
+    HINTERNET hSession = WinHttpOpen(L"Zorro-cTrader/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    std::wstring hdr = L"Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\n";
+    WinHttpAddRequestHeaders(hRequest, hdr.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD|WINHTTP_ADDREQ_FLAG_REPLACE);
+    DWORD dwLen = (DWORD)formData.size();
+    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, (LPVOID)formData.data(), dwLen, dwLen, 0)) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    if (!WinHttpReceiveResponse(hRequest, NULL)) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    DWORD status=0, size=sizeof(status); if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX)) { char m[128]; sprintf_s(m, "HTTP status: %lu", status); showMsg(m); }
+    DWORD dwSize = 0; do { DWORD dwDownloaded = 0; if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break; if (dwSize == 0) break; std::string chunk; chunk.resize(dwSize); if (!WinHttpReadData(hRequest, &chunk[0], dwSize, &dwDownloaded)) break; chunk.resize(dwDownloaded); outBody += chunk; } while (dwSize > 0);
+    if (!outBody.empty()) showMsg("HTTP body:", outBody.c_str());
+    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+    return !outBody.empty();
+}
+
+static bool winhttp_get(const std::wstring& host, const std::wstring& pathAndQuery, std::string& outBody) {
+    outBody.clear();
+    HINTERNET hSession = WinHttpOpen(L"Zorro-cTrader/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", pathAndQuery.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    std::wstring hdr = L"Accept: application/json\r\n";
+    WinHttpAddRequestHeaders(hRequest, hdr.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD|WINHTTP_ADDREQ_FLAG_REPLACE);
+    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    if (!WinHttpReceiveResponse(hRequest, NULL)) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    DWORD status=0, size=sizeof(status); if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX)) { char m[128]; sprintf_s(m, "HTTP GET status: %lu", status); showMsg(m); }
+    DWORD dwSize = 0; do { DWORD dwDownloaded = 0; if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break; if (dwSize == 0) break; std::string chunk; chunk.resize(dwSize); if (!WinHttpReadData(hRequest, &chunk[0], dwSize, &dwDownloaded)) break; chunk.resize(dwDownloaded); outBody += chunk; } while (dwSize > 0);
+    if (!outBody.empty()) showMsg("HTTP GET body:", outBody.c_str());
+    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+    return !outBody.empty();
+}
+
+static bool save_tokens_to_disk(const std::string& access, const std::string& refresh) {
+    char path[MAX_PATH]; sprintf_s(path, "%soauth_token.json", G.DllPath);
+    std::ofstream f(path, std::ios::out | std::ios::trunc);
+    if (!f.is_open()) return false;
+    f << "{\n  \"access_token\": \"" << access << "\"";
+    if (!refresh.empty()) f << ",\n  \"refresh_token\": \"" << refresh << "\"";
+    f << "\n}\n";
+    f.close();
+    return true;
+}
+
+static bool parse_json_token_fields(const std::string& body, std::string& access, std::string& refresh) {
+    access.clear(); refresh.clear();
+    auto findStr = [&](const char* key)->std::string{
+        size_t p = body.find(key); if (p==std::string::npos) return {};
+        p = body.find('"', p+strlen(key)); if (p==std::string::npos) return {};
+        size_t e = body.find('"', p+1); if (e==std::string::npos) return {};
+        return body.substr(p+1, e-p-1);
+    };
+    access = findStr("\"access_token\":\""); if (access.empty()) access = findStr("\"accessToken\":\"");
+    refresh = findStr("\"refresh_token\":\""); if (refresh.empty()) refresh = findStr("\"refreshToken\":\"");
+    return !access.empty();
+}
+
+static bool body_has_error(const std::string& body, const char* code) {
+    return body.find("\"errorCode\":\"") != std::string::npos || (code && body.find(code) != std::string::npos);
+}
+
+static bool exchange_code_for_tokens(const std::string& code, const std::string& clientId, const std::string& clientSecret, std::string& accessOut, std::string& refreshOut) {
+    const char* redirect = G.RedirectUri[0]?G.RedirectUri:OAUTH_REDIRECT_URI;
+    // Try POST first
+    std::ostringstream form; form << "grant_type=authorization_code" << "&code=" << url_encode(code) << "&redirect_uri=" << url_encode(redirect) << "&client_id=" << url_encode(clientId) << "&client_secret=" << url_encode(clientSecret);
+    std::string body; if (!winhttp_post_form(OAUTH_TOKEN_HOST, OAUTH_TOKEN_PATH, form.str(), body)) { showMsg("Token POST failed"); }
+    if (!body.empty() && !body_has_error(body, "INVALID_REQUEST")) {
+        std::string acc, ref; if (parse_json_token_fields(body, acc, ref)) { accessOut=acc; refreshOut=ref; return true; }
+    }
+    // Fallback to GET as per examples
+    std::string q = std::string("/apps/token?grant_type=authorization_code&code=") + url_encode(code)
+                    + "&redirect_uri=" + url_encode(redirect)
+                    + "&client_id=" + url_encode(clientId)
+                    + "&client_secret=" + url_encode(clientSecret);
+    std::wstring wpath(q.begin(), q.end());
+    body.clear();
+    if (!winhttp_get(OAUTH_TOKEN_HOST, wpath, body)) return false;
+    if (body_has_error(body, "INVALID_REQUEST")) return false;
+    std::string acc, ref; if (!parse_json_token_fields(body, acc, ref)) return false; accessOut=acc; refreshOut=ref; return true;
+}
+
+static bool refresh_access_token() {
+    if (G.RefreshToken[0] == '\0') return false;
+    std::ostringstream form;
+    form << "grant_type=refresh_token"
+         << "&refresh_token=" << url_encode(G.RefreshToken)
+         << "&client_id=" << url_encode(G.ClientId)
+         << "&client_secret=" << url_encode(G.ClientSecret);
+    std::string body;
+    if (winhttp_post_form(OAUTH_TOKEN_HOST, OAUTH_TOKEN_PATH, form.str(), body)) {
+        if (!body_has_error(body, nullptr)) {
+            std::string acc, ref; if (parse_json_token_fields(body, acc, ref)) { if (!ref.empty()) strncpy_s(G.RefreshToken, sizeof(G.RefreshToken), ref.c_str(), _TRUNCATE); strncpy_s(G.Token, sizeof(G.Token), acc.c_str(), _TRUNCATE); save_tokens_to_disk(acc, ref); return true; }
+        }
+    }
+    // GET fallback
+    std::string q = std::string("/apps/token?grant_type=refresh_token&refresh_token=") + url_encode(G.RefreshToken)
+                  + "&client_id=" + url_encode(G.ClientId)
+                  + "&client_secret=" + url_encode(G.ClientSecret);
+    std::wstring wpath(q.begin(), q.end()); body.clear();
+    if (!winhttp_get(OAUTH_TOKEN_HOST, wpath, body)) return false;
+    if (body_has_error(body, nullptr)) return false;
+    std::string acc, ref; if (!parse_json_token_fields(body, acc, ref)) return false; if (!ref.empty()) strncpy_s(G.RefreshToken, sizeof(G.RefreshToken), ref.c_str(), _TRUNCATE); strncpy_s(G.Token, sizeof(G.Token), acc.c_str(), _TRUNCATE); save_tokens_to_disk(acc, ref); return true;
+}
+
+static bool perform_interactive_oauth_flow() {
+    const char* redirect = G.RedirectUri[0]?G.RedirectUri:OAUTH_REDIRECT_URI;
+    const char* scope = G.Scope[0]?G.Scope:"trading";
+    const char* product = G.Product[0]?G.Product:"web";
+    std::ostringstream url;
+    url << OAUTH_GRANT_URL
+        << "?response_type=code"
+        << "&client_id=" << url_encode(G.ClientId)
+        << "&redirect_uri=" << url_encode(redirect)
+        << "&scope=" << url_encode(scope)
+        << "&product=" << url_encode(product);
+    std::string surl = url.str();
+    showMsg("Opening browser for OAuth:", surl.c_str());
+    ShellExecuteA(NULL, "open", surl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    std::string code; if (!oauth_listen_for_code(code, OAUTH_LISTEN_PORT, 60000)) { showMsg("OAuth: no code received (timeout)"); return false; }
+    showMsg("OAuth: code received. Exchanging for tokens...");
+    std::string access, refresh; if (!exchange_code_for_tokens(code, G.ClientId, G.ClientSecret, access, refresh)) return false;
+    strncpy_s(G.Token, sizeof(G.Token), access.c_str(), _TRUNCATE);
+    if (!refresh.empty()) strncpy_s(G.RefreshToken, sizeof(G.RefreshToken), refresh.c_str(), _TRUNCATE);
+    save_tokens_to_disk(access, refresh);
+    showMsg("OAuth: tokens acquired and saved.");
+    return true;
+}
+
+static const char* host_for_env() { return (G.Env == CtraderEnv::Live) ? CTRADER_HOST_LIVE : CTRADER_HOST_DEMO; }
+
+// WebSocket connect/disconnect/send/recv
+bool tcp_connect(const char* host, const char* /*portStr*/) {
+    // Close any previous handles
+    tcp_disconnect();
+    std::wstring whost; for (const char* p=host; *p; ++p) whost.push_back((wchar_t)*p);
+    G.hSession = WinHttpOpen(L"Zorro-cTrader/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!G.hSession) { showMsg("WinHTTP open failed"); return false; }
+    G.hConnect = WinHttpConnect(G.hSession, whost.c_str(), CTRADER_WS_PORT, 0);
+    if (!G.hConnect) { showMsg("WinHTTP connect failed"); tcp_disconnect(); return false; }
+    HINTERNET hRequest = WinHttpOpenRequest(G.hConnect, L"GET", L"/", NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { showMsg("WinHTTP open request failed"); tcp_disconnect(); return false; }
+    // Upgrade to WebSocket: pass NULL and 0 as per WinHTTP docs
+    if (!WinHttpSetOption(hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0)) {
+        DWORD err = GetLastError(); char emsg[128]; sprintf_s(emsg, "WinHTTP set upgrade option failed (err=%lu)", err); showMsg(emsg);
+        WinHttpCloseHandle(hRequest); tcp_disconnect(); return false; }
+    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) || !WinHttpReceiveResponse(hRequest, NULL)) {
+        DWORD err = GetLastError(); char emsg[128]; sprintf_s(emsg, "WinHTTP send/receive failed (err=%lu)", err); showMsg(emsg);
+        WinHttpCloseHandle(hRequest); tcp_disconnect(); return false; }
+    G.hWebSocket = WinHttpWebSocketCompleteUpgrade(hRequest, 0);
+    WinHttpCloseHandle(hRequest); // no longer needed
+    if (!G.hWebSocket) { showMsg("WebSocket upgrade failed"); tcp_disconnect(); return false; }
+    G.wsConnected = true; G.lastPingMs = GetTickCount64();
+    showMsg("WebSocket connected.");
+    return true;
+}
+
+void tcp_disconnect() {
+    if (G.hWebSocket) { WinHttpWebSocketClose(G.hWebSocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0); WinHttpCloseHandle(G.hWebSocket); G.hWebSocket = NULL; }
+    if (G.hConnect) { WinHttpCloseHandle(G.hConnect); G.hConnect = NULL; }
+    if (G.hSession) { WinHttpCloseHandle(G.hSession); G.hSession = NULL; }
+    G.wsConnected = false;
+}
+
+bool tcp_send(const char* data) {
+    if (!G.wsConnected || !G.hWebSocket) return false;
+    size_t len = strlen(data);
+    if (G.Diag >= 1) showMsg("WS SEND:", data);
+    DWORD hr = WinHttpWebSocketSend(G.hWebSocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (void*)data, (DWORD)len);
+    if (hr != S_OK) { tcp_disconnect(); return false; }
+    return true;
+}
+
+int tcp_recv(char* buffer, int len) {
+    if (!G.wsConnected || !G.hWebSocket) return -1;
+    std::string accum; accum.reserve(4096);
+    DWORD dwRead = 0; WINHTTP_WEB_SOCKET_BUFFER_TYPE type = WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
+    do {
+        char tmp[4096]; dwRead = 0; type = (WINHTTP_WEB_SOCKET_BUFFER_TYPE)0;
+        HRESULT hr = WinHttpWebSocketReceive(G.hWebSocket, tmp, sizeof(tmp), &dwRead, &type);
+        if (hr != S_OK) { tcp_disconnect(); return -1; }
+        if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) { tcp_disconnect(); return -1; }
+        if (dwRead) accum.append(tmp, tmp + dwRead);
+    } while (type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE || type == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE);
+    if (accum.empty()) return 0;
+    int copy = (int)std::min(accum.size(), (size_t)(len-1)); memcpy(buffer, accum.data(), copy); buffer[copy] = '\0';
+    if (G.Diag >= 1) showMsg("WS RECV:", buffer);
+    return copy;
+}
+
+static bool authenticate_after_connect() {
+    char request[1024] = {0}, response[16384] = {0};
+    sprintf_s(request, "{\"clientMsgId\":\"%s\",\"payloadType\":2100,\"payload\":{\"clientId\":\"%s\",\"clientSecret\":\"%s\"}}", get_msg_id(), G.ClientId, G.ClientSecret);
+    if (!tcp_send(request) || tcp_recv(response, sizeof(response)) <= 0 || !strstr(response, "\"payloadType\":2101")) { showMsg("Error: App auth failed during reconnect.", response); return false; }
+    if (G.Token[0] == '\0') return false;
+    sprintf_s(request, "{\"clientMsgId\":\"%s\",\"payloadType\":2102,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld}}", get_msg_id(), G.Token, G.CTraderAccountId);
+    if (!tcp_send(request) || tcp_recv(response, sizeof(response)) <= 0 || !strstr(response, "\"payloadType\":2103")) {
+        if (refresh_access_token()) {
+            sprintf_s(request, "{\"clientMsgId\":\"%s\",\"payloadType\":2102,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld}}", get_msg_id(), G.Token, G.CTraderAccountId);
+            if (tcp_send(request) && tcp_recv(response, sizeof(response)) > 0 && strstr(response, "\"payloadType\":2103")) return true;
+        }
+        showMsg("Error: Account auth failed during reconnect."); return false;
+    }
+    return true;
+}
+
+static void resubscribe_symbols() {
+    std::vector<long long> ids; ids.reserve(G.Symbols.size());
+    EnterCriticalSection(&G.cs_symbols);
+    for (auto &kv : G.Symbols) if (kv.second.subscribed) ids.push_back(kv.second.id);
+    LeaveCriticalSection(&G.cs_symbols);
+    if (ids.empty()) return;
+    std::ostringstream oss;
+    oss << "{\"clientMsgId\":\"" << get_msg_id() << "\",\"payloadType\":2121,\"payload\":{\"ctidTraderAccountId\":" << G.CTraderAccountId << ",\"symbolId\":[";
+    for (size_t i=0;i<ids.size();++i) { if (i) oss << ","; oss << ids[i]; }
+    oss << "]}}";
+    std::string req = oss.str(); tcp_send(req.c_str());
+}
+
+static bool attempt_reconnect(int maxRetries) {
+    const char* host = host_for_env();
+    for (int i=0;i<maxRetries;++i) {
+        char msg[128]; sprintf_s(msg, "Reconnecting attempt %d/%d...", i+1, maxRetries); showMsg(msg, host);
+        if (tcp_connect(host, "5036") && authenticate_after_connect()) { showMsg("Reconnect successful."); resubscribe_symbols(); G.lastPingMs = GetTickCount64(); return true; }
+        DWORD delay = (DWORD)(1000u << i); Sleep(delay);
+    }
+    showMsg("Reconnect failed.");
+    return false;
+}
+
+static bool load_token_from_disk() {
+    char token_path[MAX_PATH] = {0};
+    sprintf_s(token_path, "%soauth_token.json", G.DllPath);
+    std::ifstream file(token_path);
+    if (!file.is_open()) return false;
+    std::stringstream s_buffer; s_buffer << file.rdbuf(); file.close();
+    std::string content = s_buffer.str(); if (content.empty()) return false;
+    auto findStr = [&](const char* key)->std::string{
+        size_t p = content.find(key); if (p==std::string::npos) return {};
+        p = content.find('"', p+strlen(key)); if (p==std::string::npos) return {};
+        size_t e = content.find('"', p+1); if (e==std::string::npos) return {};
+        return content.substr(p+1, e-p-1);
+    };
+    std::string token = findStr("\"access_token\":\""); if (token.empty()) token = findStr("\"accessToken\":\"");
+    std::string refresh = findStr("\"refresh_token\":\""); if (refresh.empty()) refresh = findStr("\"refreshToken\":\"");
+    if (token.empty()) return false;
+    strncpy_s(G.Token, sizeof(G.Token), token.c_str(), _TRUNCATE);
+    if (!refresh.empty()) strncpy_s(G.RefreshToken, sizeof(G.RefreshToken), refresh.c_str(), _TRUNCATE);
+    return true;
+}
+
+static bool fetch_account_id_from_token(long long& outAccountId) {
+    outAccountId = 0;
+    if (G.Token[0] == '\0') return false;
+    char request[1024] = {0}, response[32768] = {0};
+    sprintf_s(request, "{\"clientMsgId\":\"%s\",\"payloadType\":2104,\"payload\":{\"accessToken\":\"%s\"}}", get_msg_id(), G.Token);
+    log_to_wesocket("Sending GetAccountListByAccessToken (2104)...");
+    if (!tcp_send(request)) { log_to_wesocket("Send failed for 2104"); return false; }
+    int n = tcp_recv(response, sizeof(response));
+    if (n <= 0) { log_to_wesocket("Recv failed for 2104"); return false; }
+    log_to_wesocket("AccountListByAccessToken response:", response);
+
+    std::vector<long long> ids; std::vector<int> lives;
+    const char* cur = response;
+    while (true) {
+        const char* pId = strstr(cur, "\"ctidTraderAccountId\":");
+        if (!pId) break; pId += strlen("\"ctidTraderAccountId\":");
+        long long id = 0; sscanf_s(pId, "%lld", &id);
+        int isLive = -1;
+        const char* pLive = strstr(pId, "\"isLive\":");
+        if (pLive && pLive - pId < 200) {
+            if (strncmp(pLive + strlen("\"isLive\":"), "true", 4) == 0) isLive = 1;
+            else if (strncmp(pLive + strlen("\"isLive\":"), "false", 5) == 0) isLive = 0;
+        }
+        if (id > 0) { ids.push_back(id); lives.push_back(isLive); }
+        cur = pId + 1;
+    }
+    if (ids.empty()) { log_to_wesocket("No ctidTraderAccountId found in 2104 response."); return false; }
+    int wantLive = (G.Env == CtraderEnv::Live) ? 1 : 0;
+    for (size_t i=0;i<ids.size();++i) {
+        if (lives[i] == wantLive) { outAccountId = ids[i]; char msg[128]; sprintf_s(msg, "Selected accountId (env match): %lld", outAccountId); log_to_wesocket(msg); return true; }
+    }
+    outAccountId = ids[0];
+    char msg[128]; sprintf_s(msg, "Selected accountId (fallback): %lld", outAccountId); log_to_wesocket(msg);
+    return true;
+}
+
+DLLFUNC int BrokerOpen(char* Name, FARPROC fpMessage, FARPROC fpProgress) {
+    strcpy_s(Name, 32, PLUGIN_NAME);
+    (FARPROC&)BrokerMessage = fpMessage;
+    (FARPROC&)BrokerProgress = fpProgress;
+    return PLUGIN_TYPE;
+}
+
+DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
+    if (G.bIsRunning) { G.bIsRunning = false; if (G.hNetworkThread) { WaitForSingleObject(G.hNetworkThread, 2000); CloseHandle(G.hNetworkThread); G.hNetworkThread = NULL; } }
+    tcp_disconnect();
+
+    ZeroMemory(G.Token, sizeof(G.Token)); ZeroMemory(G.RefreshToken, sizeof(G.RefreshToken));
+    G.CTraderAccountId = 0; G.Symbols.clear(); G.pendingTrades.clear(); G.openTrades.clear(); G.ctidToZorroId.clear(); G.pendingTradeInfo.clear(); G.nextTradeId = 1; G.lastPingMs = GetTickCount64();
+
+    // Load creds
+    CsvCreds cc; bool loadedCsv = try_load_accounts_csv(cc, User, Type);
+    if (loadedCsv) {
+        strncpy_s(G.ClientId, sizeof(G.ClientId), cc.clientId.c_str(), _TRUNCATE);
+        strncpy_s(G.ClientSecret, sizeof(G.ClientSecret), cc.clientSecret.c_str(), _TRUNCATE);
+        G.CTraderAccountId = _strtoui64(cc.accountId.c_str(), NULL, 10);
+        G.Env = detect_env_from_type(cc.type.c_str());
+        if (!cc.accessToken.empty()) { strncpy_s(G.Token, sizeof(G.Token), cc.accessToken.c_str(), _TRUNCATE); showMsg("Token loaded from Accounts.csv"); }
+        G.HasLogin = true;
+    } else {
+        strncpy_s(G.ClientId, sizeof(G.ClientId), User ? User : "", _TRUNCATE);
+        strncpy_s(G.ClientSecret, sizeof(G.ClientSecret), Pwd ? Pwd : "", _TRUNCATE);
+        G.Env = detect_env_from_type(Type);
+        if (Accounts && *Accounts) G.CTraderAccountId = _strtoui64(Accounts, NULL, 10);
+        G.HasLogin = true;
+    }
+
+    if (G.Token[0] == '\0') { if (load_token_from_disk()) showMsg("Token loaded from oauth_token.json"); }
+    if (G.Token[0] == '\0') { showMsg("No token found. Launching OAuth browser flow..."); if (!perform_interactive_oauth_flow()) { showMsg("OAuth failed"); return 0; } }
+
+    const char* host = (strstr(Type, "Live") || strstr(Type, "live")) ? CTRADER_HOST_LIVE : CTRADER_HOST_DEMO;
+    log_to_wesocket((host == CTRADER_HOST_LIVE) ? "Environment: Live" : "Environment: Demo");
+    showMsg("Connecting to:", host);
+    if (!tcp_connect(host, "5036")) return 0;
+
+    char request[1024] = {0}, response[16384] = {0};
+    sprintf_s(request, "{\"clientMsgId\":\"%s\",\"payloadType\":2100,\"payload\":{\"clientId\":\"%s\",\"clientSecret\":\"%s\"}}", get_msg_id(), G.ClientId, G.ClientSecret);
+    if (!tcp_send(request) || tcp_recv(response, sizeof(response)) <= 0 || !strstr(response, "\"payloadType\":2101")) { showMsg("Error: App auth failed.", response); log_to_wesocket("App auth (2100) failed:", response); return 0; }
+    log_to_wesocket("App auth (2101) OK");
+
+    if (G.CTraderAccountId == 0) {
+        long long aid = 0; if (fetch_account_id_from_token(aid)) { G.CTraderAccountId = aid; char msg[128]; sprintf_s(msg, "Selected accountId from token: %lld", G.CTraderAccountId); showMsg(msg); log_to_wesocket(msg); }
+    }
+
+    auto try_account_auth = [&](long long acctId)->bool{
+        char locRes[16384] = {0}; char req[512] = {0};
+        sprintf_s(req, "{\"clientMsgId\":\"%s\",\"payloadType\":2102,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld}}", get_msg_id(), G.Token, acctId);
+        log_to_wesocket("Trying AccountAuth (2102) for:", req);
+        if (!tcp_send(req)) return false;
+        int r = tcp_recv(locRes, sizeof(locRes)); if (r <= 0) return false;
+        log_to_wesocket("AccountAuth response:", locRes);
+        if (strstr(locRes, "\"payloadType\":2103")) { return true; }
+        return false;
+    };
+
+    if (!try_account_auth(G.CTraderAccountId)) {
+        showMsg("Account auth failed, fetching account list..."); log_to_wesocket("Account auth failed with provided ID, fetching list and retrying...");
+        long long aid = 0;
+        if (fetch_account_id_from_token(aid)) {
+            if (aid != G.CTraderAccountId && try_account_auth(aid)) { G.CTraderAccountId = aid; }
+            else {
+                char respList[32768] = {0};
+                char reqList[1024] = {0}; sprintf_s(reqList, "{\"clientMsgId\":\"%s\",\"payloadType\":2104,\"payload\":{\"accessToken\":\"%s\"}}", get_msg_id(), G.Token);
+                log_to_wesocket("Retrying AccountAuth over all IDs from 2104 list...");
+                if (tcp_send(reqList) && tcp_recv(respList, sizeof(respList)) > 0) {
+                    const char* cur = respList;
+                    while (true) {
+                        const char* pId = strstr(cur, "\"ctidTraderAccountId\":"); if (!pId) break; pId += strlen("\"ctidTraderAccountId\":"); long long id=0; sscanf_s(pId, "%lld", &id);
+                        if (id>0) { char msg[128]; sprintf_s(msg, "Trying accountId: %lld", id); log_to_wesocket(msg); if (try_account_auth(id)) { G.CTraderAccountId = id; break; } }
+                        cur = pId + 1;
+                    }
+                }
+            }
+        }
+        if (G.CTraderAccountId == 0) {
+            log_to_wesocket("Account auth still failed, attempting refresh token...");
+        }
+        if (G.CTraderAccountId == 0 || !strstr(response, "\"payloadType\":2103")) {
+            showMsg("Account auth failed, trying refresh_token...");
+            if (refresh_access_token()) {
+                if (!try_account_auth(G.CTraderAccountId)) { showMsg("Error: Account auth failed after refresh."); log_to_wesocket("Account auth failed after refresh token."); return 0; }
+            } else {
+                showMsg("Refresh token not available or failed."); log_to_wesocket("Refresh token not available or failed.");
+                return 0;
+            }
+        }
+    }
+
+    const char* pAccountId = strstr(response, "\"ctidTraderAccountId\":");
+    if (pAccountId) sscanf_s(pAccountId, "\"ctidTraderAccountId\":%lld", &G.CTraderAccountId); else { showMsg("Error: Could not parse account ID."); log_to_wesocket("Could not parse ctidTraderAccountId from 2103 response"); return 0; }
+    { char msg[128]; sprintf_s(msg, "Account auth OK. Using accountId: %lld", G.CTraderAccountId); log_to_wesocket(msg); }
+
+    showMsg("Fetching symbol list...");
+    sprintf_s(request, "{\"clientMsgId\":\"%s\",\"payloadType\":2114,\"payload\":{\"ctidTraderAccountId\":%lld}}", get_msg_id(), G.CTraderAccountId);
+    if (!tcp_send(request) || tcp_recv(response, sizeof(response)) <= 0 || !strstr(response, "\"payloadType\":2115")) { showMsg("Error: Failed to get symbol list.", response); log_to_wesocket("Symbol list failed (2114)", response); return 0; }
+
+    const char* pSymbol = strstr(response, "\"symbol\":[");
+    if (pSymbol) {
+        pSymbol += strlen("\"symbol\":[");
+        const char* pEnd = strstr(pSymbol, "]");
+        if (pEnd) {
+            std::string all_symbols(pSymbol, pEnd - pSymbol);
+            const char* current = all_symbols.c_str();
+            while ((current = strstr(current, "{"))) {
+                SymbolInfo info = {0, 5, false, 0, 0}; char symbolName[64] = {0};
+                const char* pId = strstr(current, "\"symbolId\":"); if(pId) sscanf_s(pId, "\"symbolId\":%lld", &info.id);
+                const char* pName = strstr(current, "\"symbolName\":\""); if(pName) sscanf_s(pName, "\"symbolName\":\"%63[^\"]\"", symbolName, (unsigned)_countof(symbolName));
+                const char* pDigits = strstr(current, "\"digits\":"); if(pDigits) sscanf_s(pDigits, "\"digits\":%d", &info.digits);
+                if (info.id > 0 && strlen(symbolName) > 0) G.Symbols[symbolName] = info;
+                current++;
+            }
+        }
+    }
+
+    char msg[128]; sprintf_s(msg, "Loaded %zu symbols.", G.Symbols.size()); showMsg(msg);
+    G.bIsRunning = true;
+    G.hNetworkThread = (HANDLE)_beginthreadex(NULL, 0, &NetworkThread, NULL, 0, NULL);
+    if (!G.hNetworkThread) { G.bIsRunning = false; return 0; }
+
+    showMsg("Login successful.");
+    return 1;
+}
+
+DLLFUNC void BrokerClose() {
+    if (G.bIsRunning) {
+        G.bIsRunning = false;
+        if(G.hNetworkThread) { WaitForSingleObject(G.hNetworkThread, 2000); CloseHandle(G.hNetworkThread); G.hNetworkThread = NULL; }
+    }
+    tcp_disconnect();
+}
+
+DLLFUNC int BrokerBuy2(char* Symbol, int nAmount, double, double, double* pPrice, int* pFill) {
+    if (G.CTraderAccountId == 0 || G.Symbols.find(Symbol) == G.Symbols.end()) return 0;
+    long long symbolId = G.Symbols[Symbol].id;
+    int tradeSide = (nAmount > 0) ? 1 : 2;
+    long long volumeInCents = (long long)abs(nAmount) * 100000;
+    std::string clientMsgId = get_msg_id();
+    int zorroTradeId = G.nextTradeId++;
+    EnterCriticalSection(&G.cs_trades);
+    G.pendingTrades[clientMsgId] = zorroTradeId;
+    G.pendingTradeInfo[zorroTradeId] = std::make_pair(std::string(Symbol), (nAmount > 0 ? 1 : -1));
+    LeaveCriticalSection(&G.cs_trades);
+    char request[1024];
+    sprintf_s(request, "{\"clientMsgId\":\"%s\",\"payloadType\":2105,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld,\"symbolId\":%lld,\"orderType\":1,\"tradeSide\":%d,\"volume\":%lld}}",
+              clientMsgId.c_str(), G.Token, G.CTraderAccountId, symbolId, tradeSide, volumeInCents);
+    if (!tcp_send(request)) { EnterCriticalSection(&G.cs_trades); G.pendingTrades.erase(clientMsgId); G.pendingTradeInfo.erase(zorroTradeId); LeaveCriticalSection(&G.cs_trades); return 0; }
+    if (pFill) *pFill = nAmount; if (pPrice) *pPrice = 0; return zorroTradeId;
+}
+
+DLLFUNC int BrokerAsset(char* Symbol, double* pPrice,double* pSpread, double*, double *pPip, double*, double*, double*, double*, double*) {
+    if (G.Symbols.find(Symbol) == G.Symbols.end()) return 0;
+    EnterCriticalSection(&G.cs_symbols); SymbolInfo& info = G.Symbols[Symbol];
+    if (!info.subscribed) { info.subscribed = true; LeaveCriticalSection(&G.cs_symbols); char request[512]; sprintf_s(request, "{\"clientMsgId\":\"%s\",\"payloadType\":2121,\"payload\":{\"ctidTraderAccountId\":%lld,\"symbolId\":[%lld]}}", get_msg_id(), G.CTraderAccountId, info.id); if (!tcp_send(request)) { EnterCriticalSection(&G.cs_symbols); info.subscribed = false; LeaveCriticalSection(&G.cs_symbols); return 0; } } else { LeaveCriticalSection(&G.cs_symbols); }
+    EnterCriticalSection(&G.cs_symbols); double d_bid = 0, d_ask = 0; if (info.bid > 0 && info.ask > 0) { d_bid = (double)info.bid / pow(10, info.digits); d_ask = (double)info.ask / pow(10, info.digits); } LeaveCriticalSection(&G.cs_symbols);
+    if (pPrice) *pPrice = (d_bid > 0 && d_ask > 0) ? (d_bid + d_ask) / 2.0 : 0; if (pSpread) *pSpread = (d_bid > 0 && d_ask > 0) ? (d_ask - d_bid) : 0; if (pPip) *pPip = 1.0 / pow(10, G.Symbols[Symbol].digits); return 1;
+}
+
+DLLFUNC int BrokerTime(DATE* pTime) { if (pTime) { SYSTEMTIME st; GetSystemTime(&st); SystemTimeToVariantTime(&st, pTime); } return 1; }
+
+DLLFUNC int BrokerSell(int nTradeID, int nAmount) {
+    EnterCriticalSection(&G.cs_trades); auto it = G.openTrades.find(nTradeID); if (it == G.openTrades.end()) { LeaveCriticalSection(&G.cs_trades); return 0; } Trade &t = it->second; LeaveCriticalSection(&G.cs_trades);
+    long long volumeInCents = (long long)((nAmount != 0 ? abs(nAmount) : abs(t.amount)) * 100000ll);
+    char request[512]; sprintf_s(request, "{\"clientMsgId\":\"%s\",\"payloadType\":2108,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld,\"positionId\":%lld,\"volume\":%lld}}", get_msg_id(), G.Token, G.CTraderAccountId, t.ctid, volumeInCents);
+    if (!tcp_send(request)) return 0; return 1;
+}
+
+DLLFUNC int BrokerTrade(int nTradeID, double* pOpen, double* pClose, double* pRoll, double* pProfit) {
+    EnterCriticalSection(&G.cs_trades); auto it = G.openTrades.find(nTradeID); if (it == G.openTrades.end()) { LeaveCriticalSection(&G.cs_trades); return 0; } Trade t = it->second; LeaveCriticalSection(&G.cs_trades);
+    if (pOpen) *pOpen = t.openPrice; if (pClose) *pClose = t.closed ? t.closePrice : 0; if (pRoll) *pRoll = t.swap; if (pProfit) *pProfit = t.profit; return 1;
+}
+
+DLLFUNC int BrokerAccount(char*, double* pBalance, double*, double*) { if (pBalance) *pBalance = 10000; return 1; }
+DLLFUNC double BrokerCommand(int Mode, intptr_t p) { if (Mode == 138) G.Diag = (int)p; return 0; }
+DLLFUNC char* BrokerRequest(const char*, const char*, const char*) { return NULL; }
+DLLFUNC int BrokerLogout(void) { return 1; }
+
+// ---- DllMain ----
+BOOL APIENTRY DllMain(HANDLE hModule, DWORD ul_reason_for_call, LPVOID) {
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        InitializeCriticalSection(&G.cs_symbols); InitializeCriticalSection(&G.cs_trades); InitializeCriticalSection(&G.cs_log);
+        GetModuleFileNameA((HMODULE)hModule, G.DllPath, MAX_PATH);
+        char* pLastSlash = strrchr(G.DllPath, '\\'); if (pLastSlash) *(pLastSlash + 1) = '\0';
+        strcpy_s(G.LogPath, G.DllPath); strcat_s(G.LogPath, "ctrader.log");
+        G.RedirectUri[0] = '\0'; strcpy_s(G.Scope, "trading"); strcpy_s(G.Product, "web");
+        G.hSession = NULL; G.hConnect = NULL; G.hWebSocket = NULL; G.wsConnected = false;
+        showMsg("Plugin Directory:", G.DllPath);
+        WSADATA wsaData; WSAStartup(MAKEWORD(2, 2), &wsaData);
+        G.lastPingMs = GetTickCount64(); G.HasLogin = false;
+    } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
+        BrokerClose(); DeleteCriticalSection(&G.cs_symbols); DeleteCriticalSection(&G.cs_trades); DeleteCriticalSection(&G.cs_log); WSACleanup();
+    }
+    return TRUE;
+}
+
+unsigned __stdcall NetworkThread(void*) {
+    char buffer[32768];
+    while (G.bIsRunning) {
+        int bytes_received = tcp_recv(buffer, sizeof(buffer));
+        if (bytes_received < 0) {
+            showMsg("Network thread: connection lost.");
+            if (G.HasLogin && attempt_reconnect()) { showMsg("Reconnected. Continuing stream."); continue; }
+            G.bIsRunning = false; break;
+        }
+        if (bytes_received == 0) {
+            ULONGLONG now = GetTickCount64(); if (now - G.lastPingMs >= PING_INTERVAL_MS) { char ping[64]; sprintf_s(ping, "{\"payloadType\":2106,\"payload\":{}}"); tcp_send(ping); G.lastPingMs = now; }
+            continue;
+        }
+        G.lastPingMs = GetTickCount64();
+
+        const char* pPayloadType = strstr(buffer, "\"payloadType\":"); int payloadType = 0; if (pPayloadType) sscanf_s(pPayloadType, "\"payloadType\":%d", &payloadType);
+        if (payloadType == 2126) {
+            if (strstr(buffer, "\"executionType\"")) {
+                char clientMsgId[64] = { 0 }; const char* pClientMsgId = strstr(buffer, "\"clientMsgId\":\""); if (pClientMsgId) sscanf_s(pClientMsgId, "\"clientMsgId\":\"%63[^\"]\"", clientMsgId, (unsigned)_countof(clientMsgId));
+                EnterCriticalSection(&G.cs_trades); auto it = G.pendingTrades.find(clientMsgId); if (it != G.pendingTrades.end()) {
+                    int zorroId = it->second; const char* pExecType = strstr(buffer, "\"executionType\":\"");
+                    if (pExecType && (strncmp(pExecType + 17, "ORDER_ACCEPTED", 14) == 0 || strncmp(pExecType + 17, "ORDER_FILLED", 12) == 0)) {
+                        Trade newTrade = {}; newTrade.zorroId = zorroId; const char* pPosId = strstr(buffer, "\"positionId\":"); if (pPosId) sscanf_s(pPosId, "\"positionId\":%lld", &newTrade.ctid);
+                        const char* pPrice = strstr(buffer, "\"executionPrice\":"); if (pPrice) sscanf_s(pPrice, "\"executionPrice\":%lf", &newTrade.openPrice);
+                        const char* pVolume = strstr(buffer, "\"executedVolume\":"); int vol = 0; if (pVolume) sscanf_s(pVolume, "\"executedVolume\":%d", &vol);
+                        auto pit = G.pendingTradeInfo.find(zorroId); if (pit != G.pendingTradeInfo.end()) { newTrade.symbol = pit->second.first; int side = pit->second.second; newTrade.amount = side * (vol != 0 ? vol : 1); G.pendingTradeInfo.erase(pit); } else { newTrade.amount = vol; }
+                        G.openTrades[zorroId] = newTrade; G.ctidToZorroId[newTrade.ctid] = zorroId;
+                    }
+                    G.pendingTrades.erase(it);
+                }
+                LeaveCriticalSection(&G.cs_trades);
+            } else {
+                long long symbolId = 0; const char* pSymbolId = strstr(buffer, "\"symbolId\":"); if (pSymbolId) sscanf_s(pSymbolId, "\"symbolId\":%lld", &symbolId);
+                if (symbolId > 0) { EnterCriticalSection(&G.cs_symbols); for (auto& pair : G.Symbols) { if (pair.second.id == symbolId) { const char* pBid = strstr(buffer, "\"bid\":"); if (pBid) sscanf_s(pBid, "\"bid\":%lld", &pair.second.bid); const char* pAsk = strstr(buffer, "\"ask\":"); if (pAsk) sscanf_s(pAsk, "\"ask\":%lld", &pair.second.ask); break; } } LeaveCriticalSection(&G.cs_symbols); }
+            }
+        }
+        if (payloadType == 2126 && strstr(buffer, "\"positionStatus\":\"POSITION_CLOSED\"")) {
+            const char* pPosId = strstr(buffer, "\"positionId\":"); long long pid = 0; if (pPosId) sscanf_s(pPosId, "\"positionId\":%lld", &pid);
+            double profit = 0.0; const char* pProfit = strstr(buffer, "\"profit\":"); if (pProfit) sscanf_s(pProfit, "\"profit\":%lf", &profit);
+            EnterCriticalSection(&G.cs_trades); auto zit = G.ctidToZorroId.find(pid); if (zit != G.ctidToZorroId.end()) { Trade &tr = G.openTrades[zit->second]; tr.closed = true; tr.profit = profit; tr.closePrice = 0; } LeaveCriticalSection(&G.cs_trades);
+        } else if (payloadType == 2106) {
+            char request[128]; sprintf_s(request, "{\"payloadType\":2106,\"payload\":{}}" ); tcp_send(request);
+        }
+    }
+    return 0;
+}
+
+// ---- Accounts.csv reader (captures RedirectUri/Scope/Product if present) ----
+static bool try_load_accounts_csv(struct CsvCreds& out, const char* hintAccountOrUser, const char* typeHint) {
+    auto file_exists = [](const char* path)->bool{ DWORD a = GetFileAttributesA(path); return (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)); };
+    auto trim_copy = [](const std::string& s){ size_t b=0,e=s.size(); while(b<e && (s[b]==' '||s[b]=='\t'||s[b]=='\r'||s[b]=='\n')) ++b; while(e>b && (s[e-1]==' '||s[e-1]=='\t'||s[e-1]=='\r'||s[e-1]=='\n')) --e; return s.substr(b,e-b); };
+    auto split_csv_line = [&](const std::string& line){ std::vector<std::string> outv; std::string cur; bool inq=false; for(char c: line){ if(c=='"'){inq=!inq; continue;} if(!inq && (c==','||c==';'||c=='\t')){ outv.push_back(trim_copy(cur)); cur.clear(); } else cur.push_back(c);} outv.push_back(trim_copy(cur)); return outv; };
+    auto build_parent_history_path = [&](char* outp, size_t outsz, const char* fileName){ char parent[MAX_PATH]; strcpy_s(parent, G.DllPath); size_t len=strlen(parent); if(len>0 && (parent[len-1]=='\\'||parent[len-1]=='/')) parent[len-1]='\0'; char* last=strrchr(parent,'\\'); if(last) *last='\0'; sprintf_s(outp,outsz, "%s\\History\\%s", parent, fileName); };
+
+    char path1[MAX_PATH]; strcpy_s(path1, G.DllPath); strcat_s(path1, "Accounts.csv");
+    char path2[MAX_PATH]; strcpy_s(path2, G.DllPath); strcat_s(path2, "account.csv");
+    char path3[MAX_PATH]; build_parent_history_path(path3, sizeof(path3), "Accounts.csv");
+    char path4[MAX_PATH]; build_parent_history_path(path4, sizeof(path4), "account.csv");
+    const char* use = nullptr; if (file_exists(path1)) use = path1; else if (file_exists(path2)) use = path2; else if (file_exists(path3)) use = path3; else if (file_exists(path4)) use = path4;
+    if (!use) { showMsg("Accounts.csv not found in plugin or History folder."); return false; }
+
+    std::ifstream f(use); if (!f.is_open()) return false;
+    std::string header; if (!std::getline(f, header)) return false;
+    auto cols = split_csv_line(header);
+    std::map<std::string,int> idx; for (size_t i=0;i<cols.size();++i){ std::string k=cols[i]; ascii_tolower_inplace(k); idx[k]=(int)i; }
+    auto get = [&](const std::vector<std::string>& row, const char* key)->std::string{ std::string k(key); ascii_tolower_inplace(k); auto it=idx.find(k); if(it==idx.end()||it->second>=(int)row.size()) return std::string(); return row[it->second]; };
+
+    CsvCreds selected; bool found=false;
+    while (f) {
+        std::string line; if (!std::getline(f,line)) break; if(line.empty()) continue; auto row=split_csv_line(line); if(row.empty()) continue;
+        std::string plugin = get(row, "Plugin"); std::string server=get(row,"Server"); std::string broker=get(row,"Broker");
+        std::string accountName=get(row,"Account"); std::string zorroName=get(row,"Name"); std::string type=get(row,"Type"); std::string realFlag=get(row,"Real");
+        std::string accountId=get(row,"AccountId"); if(accountId.empty()) accountId=get(row,"AccountNumber");
+        std::string user=get(row,"User"); if(user.empty()) user=get(row,"ClientId");
+        std::string pass=get(row,"Pass"); if(pass.empty()) pass=get(row,"ClientSecret"); if(pass.empty()) pass=get(row,"Password");
+        std::string token=get(row,"AccessToken"); if(token.empty()) token=get(row,"Token");
+        std::string redirectUri=get(row,"RedirectUri"); if(redirectUri.empty()) redirectUri=get(row,"RedirectURL");
+        std::string scope=get(row,"Scope"); std::string product=get(row,"Product");
+
+        auto contains_ci = [](const std::string& s, const char* sub){ std::string a=s; std::string b=sub?sub:""; ascii_tolower_inplace(a); ascii_tolower_inplace(b); return a.find(b)!=std::string::npos; };
+        if (!plugin.empty() && !contains_ci(plugin.c_str(), "ctrader")) continue;
+        if (!server.empty() && !contains_ci(server.c_str(), "ctrader")) continue;
+        if (!broker.empty() && !contains_ci(broker.c_str(), "ctrader")) continue;
+
+        bool matches=true; if(hintAccountOrUser && *hintAccountOrUser){ bool digits=true; for(const char* p=hintAccountOrUser; *p; ++p){ if(*p<'0'||*p>'9'){digits=false;break;} } matches = digits ? (accountId==hintAccountOrUser) : (contains_ci(accountId.c_str(),hintAccountOrUser)||contains_ci(user.c_str(),hintAccountOrUser)||contains_ci(accountName.c_str(),hintAccountOrUser)); }
+        if(!matches) continue;
+        bool typeOk=true; if(typeHint && *typeHint){ if(!type.empty()) typeOk = contains_ci(type.c_str(), typeHint); else if(!zorroName.empty()) typeOk = contains_ci(zorroName.c_str(), typeHint); else if(!realFlag.empty()){ int rf=atoi(realFlag.c_str()); typeOk = (rf?contains_ci("live", typeHint):contains_ci("demo", typeHint)); } }
+        if(!typeOk) continue;
+
+        selected.clientId=user; selected.clientSecret=pass; selected.accountId=accountId; selected.type = !type.empty()?type:(!zorroName.empty()?zorroName:(atoi(realFlag.c_str())?"Live":"Demo")); selected.accessToken=token;
+        if (!redirectUri.empty()) { strncpy_s(G.RedirectUri, sizeof(G.RedirectUri), redirectUri.c_str(), _TRUNCATE); }
+        if (!scope.empty()) { strncpy_s(G.Scope, sizeof(G.Scope), scope.c_str(), _TRUNCATE); }
+        if (!product.empty()) { strncpy_s(G.Product, sizeof(G.Product), product.c_str(), _TRUNCATE); }
+        if(!selected.clientId.empty() && !selected.clientSecret.empty() && !selected.accountId.empty()) { found=true; break; }
+    }
+    if(!found) return false; out=selected; char log[256]; sprintf_s(log, "Loaded credentials from: %s", use); showMsg(log); return true;
+}

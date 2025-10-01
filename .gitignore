@@ -1,0 +1,57 @@
+# Visual Studio
+.vs/
+bin/
+obj/
+*.user
+*.suo
+*.ncb
+*.aps
+*.pch
+*.pdb
+*.idb
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.rsp
+*.pgc
+*.pgd
+*.meta
+
+# Build outputs
+Debug/
+Release/
+x64/
+Win32/
+*.dll
+*.lib
+*.exp
+*.obj
+*.iobj
+*.ipdb
+*.log
+*.tlog
+*.lastbuildstate
+*.recipe
+*.FileListAbsolute.txt
+*.CppClean.log
+
+# vcpkg
+vcpkg_installed/
+
+# Zorro specific
+*.t6
+*.t1
+*.t2
+wesocket.txt
+ctrader.log
+oauth_token.json
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# OS generated files
+Thumbs.db
+.DS_Store

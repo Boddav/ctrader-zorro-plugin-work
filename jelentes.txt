@@ -1,0 +1,156 @@
+# cTrader Plugin for Zorro Trading Platform - Development Report
+
+## Project Overview
+Complete cTrader broker plugin for Zorro trading platform with WebSocket-based OpenAPI integration.
+
+## Current Status - CRITICAL DEBUG PHASE
+- OAuth2 authentication: WORKING
+- WebSocket connection: STABLE
+- Symbol loading: 123 symbols loaded successfully
+- Account authentication: PayloadType 2102/2103 working
+- Modular architecture: Implemented (trading.cpp, account.cpp, history.cpp, symbols.cpp)
+- Symbol normalization: EUR/USD ↔ EURUSD conversion implemented
+- Payload format fixes: Corrected to match cTrader OpenAPI specification
+- Enhanced debugging: Comprehensive logging added
+
+## URGENT ISSUES REQUIRING DEEP INVESTIGATION
+
+### 1. Symbol Lookup Failure (Error 053)
+SYMPTOM: "Error 053: AUD/USD currently unavailable" despite AUDUSD being loaded
+INVESTIGATION NEEDED:
+- Test enhanced debug logging in GetSymbolByIdOrName()
+- Verify BrokerAsset calls are reaching the plugin
+- Analyze symbol normalization flow: "AUD/USD" → "AUDUSD"
+
+### 2. Historical Data Failure (Error 047)
+SYMPTOM: "Error 047: No bars generated"
+INVESTIGATION NEEDED:
+- Verify 2112/2113 payload type handling
+- Check ProcessHistoricalResponse() execution
+- Analyze T6 structure conversion from JSON OHLC data
+
+### 3. Account Info Response Handler
+RECENTLY IMPLEMENTED: 2122 (ProtoOATraderRes) handler
+NEEDS VERIFICATION: Account balance/equity updates in wesocket.txt
+
+## Technical Implementation Details
+
+### Authentication Flow (CORRECT)
+1. App Auth (PayloadType 2100): clientId + clientSecret
+2. Account Auth (PayloadType 2102): accessToken + ctidTraderAccountId
+3. Trading/Data requests: ONLY ctidTraderAccountId (NO accessToken in payload!)
+
+### Critical Payload Types (VERIFIED CORRECT)
+- Account Info: 2121 (Request) → 2122 (Response) [FIXED from incorrect 2104]
+- Historical Data: 2112 (Request) → 2113 (Response)
+- New Order: 2105 (Request) → 2106 (Response) [accessToken removed from payload]
+- Symbols: 2114 (Request) → 2115 (Response)
+
+### Symbol Format Handling (IMPLEMENTED)
+```cpp
+// Challenge: Zorro sends "AUD/USD" (slash format)
+// cTrader stores: "AUDUSD" (concatenated format)
+// Solution: GetSymbolByIdOrName() with bidirectional conversion
+//   1. Exact match: "AUD/USD" → "AUD/USD"
+//   2. Normalize: "AUD/USD" → "AUDUSD"
+//   3. Add slash: "AUDUSD" → "AUD/USD"
+//   4. Partial match: "EURUSD" vs "EURUSDt"
+```
+
+## AssetsFix.csv Configuration (OPTIONAL ENHANCEMENT)
+LOCATION: History folder (C:\Users\Administrator\Desktop\z3\History\AssetsFix.csv)
+PURPOSE: Custom symbol mapping for Zorro C-lite language compatibility
+
+EXPECTED CSV FORMAT:
+```csv
+# Asset mapping for cTrader symbols
+# Format: ZorroSymbol,cTraderSymbol
+EUR/USD,EURUSD
+GBP/USD,GBPUSD
+AUD/USD,AUDUSD
+USD/JPY,USDJPY
+SPX500,US500
+DAX30,DE30
+GOLD,XAUUSD
+SILVER,XAGUSD
+WTI,XTIUSD
+BRENT,XBRUSD
+BITCOIN,BTCUSD
+ETHEREUM,ETHUSD
+```
+
+IMPLEMENTATION STATUS: Plugin searches History folder for AssetsFix.csv as fallback
+CODE LOCATION: symbols.cpp GenerateBrokerAssetsFile() function
+
+## Key File Locations
+```
+Source Code:
+C:\Users\Administrator\source\repos\zorro-plugin-windows-32-3\
+├── src\main.cpp           # Core Zorro API (17 functions)
+├── src\symbols.cpp        # Enhanced symbol lookup with debug logging
+├── src\account.cpp        # Account info (2121→2122 handler)
+├── src\history.cpp        # Historical data (2112→2113)
+├── src\trading.cpp        # Order management (2105, 2108)
+
+Debug/Test Files:
+├── C:\Users\Administrator\Desktop\z3\Plugin\wesocket.txt     # CRITICAL: WebSocket communication log
+├── C:\Users\Administrator\Desktop\z3\Log\TradeTest_demo.log  # Test execution results
+├── C:\Users\Administrator\Desktop\z3\Strategy\*.c           # Test scripts
+└── C:\Users\Administrator\Desktop\z3\History\               # SEARCH HERE for AssetsFix.csv
+```
+
+## REQUEST FOR AI ASSISTANCE - DEEP INVESTIGATION REQUIRED
+
+### IMMEDIATE TASKS:
+1. **Install Enhanced Debug DLL**: Deploy latest build with comprehensive logging
+2. **Run Symbol Lookup Tests**: Execute AUD/USD, EURUSD test cases
+3. **Analyze Debug Logs**: Search wesocket.txt for:
+   - "SYMBOL_LOOKUP" messages
+   - "BROKERASSET" function calls
+   - "ACCOUNT_RESPONSE" payload type 2122
+   - "HISTORY_REQUEST" and response processing
+
+### DEEP INVESTIGATION AREAS:
+1. **Symbol Normalization Logic**: Verify GetSymbolByIdOrName() bidirectional conversion
+2. **WebSocket Message Flow**: Trace complete request→response cycles
+3. **Zorro API Integration**: Confirm BrokerAsset/BrokerHistory function invocation
+4. **Error Code Handling**: Implement ProtoOAErrorCode processing
+5. **AssetsFix.csv Integration**: Custom symbol mapping for Zorro C-lite compatibility
+
+### PERFORMANCE VALIDATION:
+1. **Memory Management**: Check for leaks in WebSocket buffer handling
+2. **Thread Safety**: Validate critical section usage
+3. **Connection Stability**: Long-term WebSocket reliability testing
+4. **Trading Operations**: Demo account order execution verification
+
+## Technical Resources for Investigation
+
+### cTrader OpenAPI Documentation:
+- Primary: https://help.ctrader.com/open-api/
+- Messages: https://help.ctrader.com/open-api/messages/
+- Authentication: https://help.ctrader.com/open-api/account-authentication/
+- Error Codes: https://help.ctrader.com/open-api/model-messages/#protooaerrorcode
+- Protocol Buffers: https://help.ctrader.com/open-api/protocol-buffers-json/
+- Technical Reference: https://m-ahmadi.github.io/ctoa/
+
+### Zorro Platform Documentation:
+- Official Site: https://zorro-project.com/
+- Financial Hacker Blog: https://financial-hacker.com/
+- C-lite Language: https://zorro-project.com/manual/en/lite_c.htm
+- Broker Plugin API: https://zorro-project.com/manual/en/brokerplugin.htm
+
+## Success Criteria
+- ✅ Symbol lookup works for both "AUD/USD" and "AUDUSD" formats
+- ✅ Historical data retrieval returns valid OHLC bars
+- ✅ Account information updates automatically every 30 seconds
+- ✅ Trading operations execute successfully on demo account
+- ✅ WebSocket connection maintains stability under extended operation
+- ✅ All cTrader error conditions handled gracefully
+- ✅ AssetsFix.csv custom mapping functional in Zorro C-lite
+
+## Current Priority
+**CRITICAL: Deploy enhanced debug logging and perform systematic analysis of symbol lookup failure chain. The plugin infrastructure is complete - investigation must focus on identifying the exact point where AUD/USD→AUDUSD conversion breaks down.**
+
+---
+Generated with Claude Code
+Co-Authored-By: Claude <noreply@anthropic.com>

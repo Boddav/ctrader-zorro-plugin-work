@@ -1,0 +1,1 @@
+# cTrader Plugin for Zorro
