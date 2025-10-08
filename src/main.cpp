@@ -11,6 +11,7 @@
 #include "../include/trading.h"
 #include "../include/account.h"
 #include "../include/history.h"
+#include "../include/history_rest.h"
 #include "../include/http_api.h"
 #include "../include/oauth_utils.h"
 #include "../include/reconnect.h"
@@ -964,28 +965,52 @@ DLLFUNC int BrokerLogout(void) {
     return 1;
 }
 
-DLLFUNC int BrokerHistory(char* Symbol, DATE tStart, DATE tEnd,
-                         int nTickMinutes, int nTicks, T6* ticks) {
-    if (!Symbol || !ticks) return 0;
-
-    char msg[256];
-    sprintf_s(msg, "BrokerHistory request: %s, %d minutes, %d ticks", Symbol, nTickMinutes, nTicks);
-    Utils::LogToFile("HISTORY_REQUEST", msg);
-
-    // RequestHistoricalData now waits synchronously for the response
-    if (History::RequestHistoricalData(Symbol, tStart, tEnd, nTickMinutes, nTicks, ticks)) {
-        Utils::LogToFile("HISTORY", "Historical data retrieved successfully");
-        // Return a reasonable number - in practice this should be the actual count
-        return nTicks; // The ticks array has been populated by ProcessHistoricalResponse
-    }
-
-    Utils::LogToFile("HISTORY", "Historical data request failed");
-    return 0;
+// Helper to convert Zorro DATE to Unix timestamp (seconds)
+long long DateToTimestamp(DATE oad) {
+    // OLE Automation date starts from 1899-12-30.
+    // Unix epoch starts from 1970-01-01.
+    // The difference is 25569 days.
+    return static_cast<long long>((oad - 25569.) * 24. * 60. * 60.);
 }
 
 DLLFUNC int BrokerHistory2(char* Symbol, DATE tStart, DATE tEnd,
                           int nTickMinutes, int nTicks, T6* ticks) {
-    return BrokerHistory(Symbol, tStart, tEnd, nTickMinutes, nTicks, ticks);
+    if (!Symbol || !ticks) return 0;
+
+    char msg[512];
+    sprintf_s(msg, "BrokerHistory2 request (REST): %s, M%d, Ticks %d", Symbol, nTickMinutes, nTicks);
+    Utils::LogToFile("HISTORY_REST", msg);
+
+    // Convert Zorro dates to Unix timestamps
+    long long from_ts = DateToTimestamp(tStart);
+    long long to_ts = DateToTimestamp(tEnd);
+
+    // Call the new REST history function
+    int downloaded_bars = HistoryRest::GetHistoryRest(
+        Symbol,
+        nTickMinutes,
+        from_ts,
+        to_ts,
+        G.Token,
+        G.CTraderAccountId
+    );
+
+    if (downloaded_bars > 0) {
+        Utils::LogToFile("HISTORY_REST", "Successfully downloaded %d bars via REST. Loading from CSV...", downloaded_bars);
+        // Load the data from the CSV into the T6 ticks array
+        int loaded_ticks = HistoryRest::LoadBarsFromCsv("ctrader_history.csv", ticks, nTicks);
+        Utils::LogToFile("HISTORY_REST", "Loaded %d ticks from CSV.", loaded_ticks);
+        return loaded_ticks;
+    }
+
+    Utils::LogToFile("HISTORY_REST", "Failed to download historical data via REST.");
+    return 0;
+}
+
+DLLFUNC int BrokerHistory(char* Symbol, DATE tStart, DATE tEnd,
+                         int nTickMinutes, int nTicks, T6* ticks) {
+    // For backward compatibility, BrokerHistory will now also use the REST implementation.
+    return BrokerHistory2(Symbol, tStart, tEnd, nTickMinutes, nTicks, ticks);
 }
 
 // ============================================================================
