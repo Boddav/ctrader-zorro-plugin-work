@@ -57,9 +57,9 @@ namespace {
 
         char request[512];
         sprintf_s(request,
-            "{\"clientMsgId\":\"%s\",\"payloadType\":2121,\"payload\":"
+            "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":"
             "{\"ctidTraderAccountId\":%lld,\"symbolId\":[%lld]}}",
-            clientMsgId.c_str(), accountId, symbolId);
+            clientMsgId.c_str(), (int)PayloadType::PROTO_OA_SUBSCRIBE_SPOTS_REQ, accountId, symbolId);
 
         if (!tcp_send(request)) {
             g_pendingSubscriptions.erase(clientMsgId);
@@ -212,9 +212,9 @@ void BatchResubscribe(long long ctidTraderAccountId) {
 
         char request[2048];
         sprintf_s(request,
-            "{\"clientMsgId\":\"%s\",\"payloadType\":2121,\"payload\":"
+            "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":"
             "{\"ctidTraderAccountId\":%lld,\"symbolId\":[%s]}}",
-            get_msg_id(), ctidTraderAccountId, ids.c_str());
+            get_msg_id(), (int)PayloadType::PROTO_OA_SUBSCRIBE_SPOTS_REQ, ctidTraderAccountId, ids.c_str());
 
         tcp_send(request);
     }

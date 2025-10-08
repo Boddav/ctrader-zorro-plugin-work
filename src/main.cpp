@@ -100,7 +100,7 @@ unsigned __stdcall NetworkThread(void*) {
         if (bytes == 0) {
             if (now - G.lastPingMs >= PING_INTERVAL_MS) {
                 char ping[128];
-                sprintf_s(ping, "{\"payloadType\":2106,\"payload\":{}}");
+                sprintf_s(ping, "{\"payloadType\":%d,\"payload\":{}}", (int)PayloadType::PROTO_OA_VERSION_REQ);
                 Network::Send(ping);
                 G.lastPingMs = now;
             }
@@ -117,8 +117,8 @@ unsigned __stdcall NetworkThread(void*) {
             sscanf_s(pType, "\"payloadType\":%d", &payloadType);
         }
 
-        // Handle subscription response (2122)
-        if (payloadType == 2122) {
+        // Handle subscription response (PROTO_OA_TRADER_RES)
+        if (payloadType == (int)PayloadType::PROTO_OA_TRADER_RES) {
             char clientMsgId[64] = {0};
             const char* pId = strstr(buffer, "\"clientMsgId\":\"");
             if (pId) {
@@ -141,8 +141,32 @@ unsigned __stdcall NetworkThread(void*) {
 
             Symbols::HandleSubscriptionResponse(clientMsgId, success, error_details);
         }
-        // Handle spot event (2126) - quotes or executions
-        else if (payloadType == 2126) {
+        // Handle spot event (PROTO_OA_SPOT_EVENT)
+        else if (payloadType == (int)PayloadType::PROTO_OA_SPOT_EVENT) {
+            long long symbolId = 0;
+            const char* pSymId = strstr(buffer, "\"symbolId\":");
+            if (pSymId) {
+                sscanf_s(pSymId, "\"symbolId\":%lld", &symbolId);
+            }
+
+            if (symbolId > 0) {
+                long long bid = 0, ask = 0;
+
+                const char* pBid = strstr(buffer, "\"bid\":");
+                if (pBid) {
+                    sscanf_s(pBid, "\"bid\":%lld", &bid);
+                }
+
+                const char* pAsk = strstr(buffer, "\"ask\":");
+                if (pAsk) {
+                    sscanf_s(pAsk, "\"ask\":%lld", &ask);
+                }
+
+                Symbols::UpdateQuote(symbolId, bid, ask);
+            }
+        }
+        // Handle execution event (PROTO_OA_EXECUTION_EVENT)
+        else if (payloadType == (int)PayloadType::PROTO_OA_EXECUTION_EVENT) {
             // Check if this is a trade execution
             if (strstr(buffer, "\"executionType\"")) {
                 char clientMsgId[64] = {0};
@@ -204,30 +228,6 @@ unsigned __stdcall NetworkThread(void*) {
 
                 LeaveCriticalSection(&G.cs_trades);
             }
-            // Quote update
-            else {
-                long long symbolId = 0;
-                const char* pSymId = strstr(buffer, "\"symbolId\":");
-                if (pSymId) {
-                    sscanf_s(pSymId, "\"symbolId\":%lld", &symbolId);
-                }
-
-                if (symbolId > 0) {
-                    long long bid = 0, ask = 0;
-
-                    const char* pBid = strstr(buffer, "\"bid\":");
-                    if (pBid) {
-                        sscanf_s(pBid, "\"bid\":%lld", &bid);
-                    }
-
-                    const char* pAsk = strstr(buffer, "\"ask\":");
-                    if (pAsk) {
-                        sscanf_s(pAsk, "\"ask\":%lld", &ask);
-                    }
-
-                    Symbols::UpdateQuote(symbolId, bid, ask);
-                }
-            }
 
             // Check for position close
             if (strstr(buffer, "\"positionStatus\":\"POSITION_CLOSED\"")) {
@@ -254,12 +254,12 @@ unsigned __stdcall NetworkThread(void*) {
                 LeaveCriticalSection(&G.cs_trades);
             }
         }
-        // Historical data response (2113)
-        else if (payloadType == 2113) {
+        // Historical data response (PROTO_OA_GET_TRENDBARS_RES)
+        else if (payloadType == (int)PayloadType::PROTO_OA_GET_TRENDBARS_RES) {
             History::ProcessHistoricalResponse(buffer);
         }
-        // Account trader info response (2122)
-        else if (payloadType == 2122) {
+        // Account trader info response (PROTO_OA_TRADER_RES)
+        else if (payloadType == (int)PayloadType::PROTO_OA_TRADER_RES) {
             Utils::LogToFile("ACCOUNT_RESPONSE", buffer);
 
             // Parse trader info for account data
@@ -299,12 +299,6 @@ unsigned __stdcall NetworkThread(void*) {
                     Utils::LogToFile("ACCOUNT_UPDATE", msg);
                 }
             }
-        }
-        // Heartbeat response (2106)
-        else if (payloadType == 2106) {
-            char pong[64];
-            sprintf_s(pong, "{\"payloadType\":2106,\"payload\":{}}");
-            Network::Send(pong);
         }
     }
 
@@ -413,13 +407,13 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
         return 0;
     }
 
-    // Application authentication (payloadType 2100)
+    // Application authentication
     char request[1024] = {0};
     char response[131072] = {0};
 
     sprintf_s(request,
-        "{\"clientMsgId\":\"%s\",\"payloadType\":2100,\"payload\":{\"clientId\":\"%s\",\"clientSecret\":\"%s\"}}",
-        Utils::GetMsgId(), G.ClientId, G.ClientSecret);
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":{\"clientId\":\"%s\",\"clientSecret\":\"%s\"}}",
+        Utils::GetMsgId(), (int)PayloadType::PROTO_OA_APPLICATION_AUTH_REQ, G.ClientId, G.ClientSecret);
 
     if (!Network::Send(request)) {
         Utils::ShowMsg("App auth send failed");
@@ -431,7 +425,9 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
         return 0;
     }
 
-    if (!strstr(response, "\"payloadType\":2101")) {
+    char expected_response[128];
+    sprintf_s(expected_response, "\"payloadType\":%d", (int)PayloadType::PROTO_OA_APPLICATION_AUTH_RES);
+    if (!strstr(response, expected_response)) {
         Utils::ShowMsg("App auth failed, trying refresh token...");
         Utils::LogToFile("APP_AUTH_RESPONSE", response);
 
@@ -441,8 +437,8 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
 
             // Retry app authentication with new token
             sprintf_s(request,
-                "{\"clientMsgId\":\"%s\",\"payloadType\":2100,\"payload\":{\"clientId\":\"%s\",\"clientSecret\":\"%s\"}}",
-                Utils::GetMsgId(), G.ClientId, G.ClientSecret);
+                "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":{\"clientId\":\"%s\",\"clientSecret\":\"%s\"}}",
+                Utils::GetMsgId(), (int)PayloadType::PROTO_OA_APPLICATION_AUTH_REQ, G.ClientId, G.ClientSecret);
 
             if (!Network::Send(request)) {
                 Utils::ShowMsg("App auth retry send failed");
@@ -454,7 +450,7 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
                 return 0;
             }
 
-            if (!strstr(response, "\"payloadType\":2101")) {
+            if (!strstr(response, expected_response)) {
                 Utils::ShowMsg("App auth failed even after token refresh");
                 Utils::LogToFile("APP_AUTH_RETRY_RESPONSE", response);
                 return 0;
@@ -489,10 +485,10 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
     auto try_account_auth = [&](long long acctId)->bool{
         char locRes[131072] = {0};
         char req[512] = {0};
-        sprintf_s(req, "{\"clientMsgId\":\"%s\",\"payloadType\":2102,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld}}",
-                 Utils::GetMsgId(), G.Token, acctId);
+        sprintf_s(req, "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld}}",
+                 Utils::GetMsgId(), (int)PayloadType::PROTO_OA_ACCOUNT_AUTH_REQ, G.Token, acctId);
 
-        Utils::LogToFile("AUTH", "Trying AccountAuth (2102) for:");
+        Utils::LogToFile("AUTH", "Trying AccountAuth for:");
 
         if (!Network::Send(req)) return false;
         int r = Network::Receive(locRes, sizeof(locRes));
@@ -501,11 +497,13 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
         Utils::LogToFile("AUTH", "AccountAuth response received");
         Utils::LogToFile("AUTH_RESPONSE", locRes);
 
-        if (strstr(locRes, "\"payloadType\":2103")) {
-            Utils::LogToFile("AUTH", "Found payloadType 2103 - SUCCESS");
+        char expected_response[128];
+        sprintf_s(expected_response, "\"payloadType\":%d", (int)PayloadType::PROTO_OA_ACCOUNT_AUTH_RES);
+        if (strstr(locRes, expected_response)) {
+            Utils::LogToFile("AUTH", "Account auth successful");
             return true;
         } else {
-            Utils::LogToFile("AUTH", "PayloadType 2103 NOT found - FAILED");
+            Utils::LogToFile("AUTH", "Account auth failed");
             return false;
         }
     };
@@ -580,8 +578,8 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
         char locRes[131072] = {0};
 
         sprintf_s(locReq,
-            "{\"clientMsgId\":\"%s\",\"payloadType\":2102,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld}}",
-            Utils::GetMsgId(), G.Token, acctId);
+            "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld}}",
+            Utils::GetMsgId(), (int)PayloadType::PROTO_OA_ACCOUNT_AUTH_REQ, G.Token, acctId);
 
         Utils::LogToFile("AUTH", "TryAccountAuth: Sending request");
         if (!Network::Send(locReq)) {
@@ -597,12 +595,14 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
         Utils::LogToFile("AUTH", "TryAccountAuth: Response received");
         Utils::LogToFile("AUTH_RESPONSE", locRes);
 
-        if (!strstr(locRes, "\"payloadType\":2103")) {
-            Utils::LogToFile("AUTH", "TryAccountAuth: PayloadType 2103 NOT found - FAILED");
+        char expected_response[128];
+        sprintf_s(expected_response, "\"payloadType\":%d", (int)PayloadType::PROTO_OA_ACCOUNT_AUTH_RES);
+        if (!strstr(locRes, expected_response)) {
+            Utils::LogToFile("AUTH", "TryAccountAuth: Auth failed");
             return false;
         }
 
-        Utils::LogToFile("AUTH", "TryAccountAuth: Found payloadType 2103 - SUCCESS");
+        Utils::LogToFile("AUTH", "TryAccountAuth: Auth successful");
 
         const char* pAcct = strstr(locRes, "\"ctidTraderAccountId\":");
         long long parsed = 0;
@@ -666,15 +666,15 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
         Utils::ShowMsg("Account authenticated");
     }
 
-    // Fetch symbols (payloadType 2114)
+    // Fetch symbols
     Utils::ShowMsg("Fetching symbols...");
 
     ZeroMemory(request, sizeof(request));
     ZeroMemory(response, sizeof(response));
 
     sprintf_s(request,
-        "{\"clientMsgId\":\"%s\",\"payloadType\":2114,\"payload\":{\"ctidTraderAccountId\":%lld}}",
-        Utils::GetMsgId(), G.CTraderAccountId);
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":{\"ctidTraderAccountId\":%lld}}",
+        Utils::GetMsgId(), (int)PayloadType::PROTO_OA_SYMBOLS_LIST_REQ, G.CTraderAccountId);
 
     if (!Network::Send(request)) {
         Utils::ShowMsg("Symbol request failed");
@@ -686,7 +686,9 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
         return 0;
     }
 
-    if (!strstr(response, "\"payloadType\":2115")) {
+    char expected_response_symbols[128];
+    sprintf_s(expected_response_symbols, "\"payloadType\":%d", (int)PayloadType::PROTO_OA_SYMBOLS_LIST_RES);
+    if (!strstr(response, expected_response_symbols)) {
         Utils::ShowMsg("Symbol fetch failed");
         return 0;
     }

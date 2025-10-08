@@ -57,10 +57,10 @@ int PlaceOrder(const char* symbol, int amount, double stopDist, double limit, do
     }
 
     sprintf_s(request,
-        "{\"clientMsgId\":\"%s\",\"payloadType\":2105,\"payload\":"
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":"
         "{\"ctidTraderAccountId\":%lld,"
         "\"symbolId\":%lld,\"orderType\":1,\"tradeSide\":%d,\"volume\":%lld%s%s}}",
-        clientMsgId.c_str(), G.CTraderAccountId, symbolId,
+        clientMsgId.c_str(), (int)PayloadType::PROTO_OA_NEW_ORDER_REQ, G.CTraderAccountId, symbolId,
         tradeSide, volumeInCents, stopLossStr.c_str(), takeProfitStr.c_str());
 
     if (!Network::Send(request)) {
@@ -94,13 +94,13 @@ int ClosePosition(int tradeId, int amount) {
 
     long long volumeInCents = (long long)((amount != 0 ? abs(amount) : abs(t.amount)) * 100000ll);
 
-    // Close position (payloadType 2108)
+    // Close position
     char request[512];
     sprintf_s(request,
-        "{\"clientMsgId\":\"%s\",\"payloadType\":2108,\"payload\":"
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":"
         "{\"ctidTraderAccountId\":%lld,"
         "\"positionId\":%lld,\"volume\":%lld}}",
-        Utils::GetMsgId(), G.CTraderAccountId, ctid, volumeInCents);
+        Utils::GetMsgId(), (int)PayloadType::PROTO_OA_CLOSE_POSITION_REQ, G.CTraderAccountId, ctid, volumeInCents);
 
     if (!Network::Send(request)) {
         Utils::ShowMsg("Close position failed");

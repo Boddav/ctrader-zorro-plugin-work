@@ -37,14 +37,14 @@ bool RequestHistoricalData(const char* symbol, DATE startTime, DATE endTime, int
     // Store pending request
     StorePendingRequest(clientMsgId, symbol, ticks, maxTicks);
 
-    // Request historical data (payloadType 2112)
+    // Request historical data
     char request[512];
     sprintf_s(request,
-        "{\"clientMsgId\":\"%s\",\"payloadType\":2112,\"payload\":"
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":"
         "{\"ctidTraderAccountId\":%lld,"
-        "\"symbolId\":%lld,\"timeframe\":%d,\"fromTimestamp\":%lld,\"toTimestamp\":%lld,\"count\":%d}}",
-        clientMsgId.c_str(), G.CTraderAccountId,
-        info->id, timeframe, startMs, endMs, maxTicks);
+        "\"symbolId\":%lld,\"period\":%d,\"fromTimestamp\":%lld,\"toTimestamp\":%lld}}",
+        clientMsgId.c_str(), (int)PayloadType::PROTO_OA_GET_TRENDBARS_REQ, G.CTraderAccountId,
+        info->id, timeframe, startMs, endMs);
 
     if (!Network::Send(request)) {
         Utils::ShowMsg("Historical data request failed");
@@ -86,8 +86,9 @@ bool GetBarData(const char* symbol, DATE startTime, DATE endTime, int timeframeM
 }
 
 void ProcessHistoricalResponse(const char* response) {
-    // Parse historical data response (payloadType 2113)
-    if (!strstr(response, "\"payloadType\":2113")) return;
+    char expected_response[128];
+    sprintf_s(expected_response, "\"payloadType\":%d", (int)PayloadType::PROTO_OA_GET_TRENDBARS_RES);
+    if (!strstr(response, expected_response)) return;
 
     Utils::LogToFile("HISTORY_RESPONSE", "Processing historical data response");
 
