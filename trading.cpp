@@ -1,0 +1,1395 @@
+#include "../include/trading.h"
+#include "../include/globals.h"
+#include "../include/utils.h"
+#include "../include/network.h"
+#include "../include/symbols.h"
+#include "../include/payloads.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <vector>
+
+namespace {
+
+bool extract_long(const char* start, const char* end, const char* token, long long& out) {
+    if (!start || !token) return false;
+    const char* pos = strstr(start, token);
+    if (!pos || (end && pos >= end)) return false;
+    pos += strlen(token);
+
+    while ((!end || pos < end) && (*pos == ' ' || *pos == '\t')) pos++;
+
+    char buffer[64] = {0};
+    size_t idx = 0;
+    while ((!end || pos < end) && idx < sizeof(buffer) - 1) {
+        char c = *pos;
+        if (!(c == '-' || c == '+' || (c >= '0' && c <= '9'))) break;
+        buffer[idx++] = c;
+        pos++;
+    }
+    if (idx == 0) return false;
+    buffer[idx] = '\0';
+    out = _strtoui64(buffer, nullptr, 10);
+    return true;
+}
+
+bool extract_int(const char* start, const char* end, const char* token, int& out) {
+    long long value = 0;
+    if (!extract_long(start, end, token, value)) return false;
+    out = static_cast<int>(value);
+    return true;
+}
+
+bool extract_double(const char* start, const char* end, const char* token, double& out) {
+    if (!start || !token) return false;
+    const char* pos = strstr(start, token);
+    if (!pos || (end && pos >= end)) return false;
+    pos += strlen(token);
+
+    while ((!end || pos < end) && (*pos == ' ' || *pos == '\t')) pos++;
+
+    char buffer[64] = {0};
+    size_t idx = 0;
+    while ((!end || pos < end) && idx < sizeof(buffer) - 1) {
+        char c = *pos;
+        if (!(c == '-' || c == '+' || (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E')) break;
+        buffer[idx++] = c;
+        pos++;
+    }
+    if (idx == 0) return false;
+    buffer[idx] = '\0';
+    out = atof(buffer);
+    return true;
+}
+
+bool extract_string(const char* start, const char* end, const char* token, std::string& out) {
+    if (!start || !token) return false;
+    const char* pos = strstr(start, token);
+    if (!pos || (end && pos >= end)) return false;
+    pos += strlen(token);
+
+    const char* cursor = pos;
+    std::string result;
+    while ((!end || cursor < end) && *cursor && *cursor != '"') {
+        if (*cursor == '\\' && (!end || cursor + 1 < end)) {
+            cursor++;
+            if (*cursor) result.push_back(*cursor);
+        } else {
+            result.push_back(*cursor);
+        }
+        cursor++;
+    }
+
+    if (*cursor != '"') return false;
+    out = result;
+    return true;
+}
+
+int NormalizeVolume(long long rawVolume) {
+    if (rawVolume == 0) return 0;
+    double lots = static_cast<double>(rawVolume) / 100000.0;
+    return static_cast<int>(std::round(lots));
+}
+
+double ScalePrice(long long rawPrice, int digits) {
+    if (digits <= 0) return static_cast<double>(rawPrice);
+    return static_cast<double>(rawPrice) / std::pow(10.0, digits);
+}
+
+double EstimateUnrealizedPnl(const Trade& trade) {
+    SymbolInfo* info = Symbols::GetSymbolByIdOrName(trade.symbol.c_str());
+    if (!info) {
+        return trade.profit;
+    }
+
+    double priceScale = std::pow(10.0, info->digits > 0 ? info->digits : 1);
+    double bid = (info->bid > 0) ? static_cast<double>(info->bid) / priceScale : 0.0;
+    double ask = (info->ask > 0) ? static_cast<double>(info->ask) / priceScale : 0.0;
+
+    double exitPrice = 0.0;
+    if (trade.amount > 0) {
+        exitPrice = (bid > 0.0) ? bid : ask;
+    } else if (trade.amount < 0) {
+        exitPrice = (ask > 0.0) ? ask : bid;
+    }
+
+    if (exitPrice <= 0.0) {
+        return trade.profit;
+    }
+
+    double priceDiff = 0.0;
+    if (trade.amount > 0) {
+        priceDiff = exitPrice - trade.openPrice;
+    } else if (trade.amount < 0) {
+        priceDiff = trade.openPrice - exitPrice;
+    }
+
+    double lots = static_cast<double>(std::abs(trade.amount));
+    return priceDiff * lots * 100000.0; // approximate unrealized PnL in quote currency
+}
+
+bool ShouldCloseTrade(const Trade& trade, Trading::CloseFilter filter, double pnlEstimate) {
+    switch (filter) {
+    case Trading::CloseFilter::AllShort:
+        return trade.amount < 0 && !trade.closePending;
+    case Trading::CloseFilter::AllLong:
+        return trade.amount > 0 && !trade.closePending;
+    case Trading::CloseFilter::AllProfitable:
+        return (pnlEstimate > 0.0) && !trade.closePending;
+    case Trading::CloseFilter::AllLosing:
+        return (pnlEstimate < 0.0) && !trade.closePending;
+    default:
+        return false;
+    }
+}
+
+const char* CloseFilterName(Trading::CloseFilter filter) {
+    switch (filter) {
+    case Trading::CloseFilter::AllShort:
+        return "ALL_SHORT";
+    case Trading::CloseFilter::AllLong:
+        return "ALL_LONG";
+    case Trading::CloseFilter::AllProfitable:
+        return "ALL_PROFIT";
+    case Trading::CloseFilter::AllLosing:
+        return "ALL_LOSS";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+} // namespace
+
+namespace Trading {
+
+int PlaceOrder(const char* symbol, int amount, double stopDist, double limit, double* pPrice, int* pFill) {
+    if (G.CTraderAccountId == 0 || !symbol) return 0;
+
+    SymbolInfo* info = Symbols::GetSymbolByIdOrName(symbol);
+    if (!info) {
+        char msg[128];
+        sprintf_s(msg, "Symbol not found: %s (normalized: %s)",
+                  symbol, Symbols::NormalizeSymbol(symbol).c_str());
+            Utils::Notify(Utils::UserMessageType::Error, "ORDER", msg);
+        return 0;
+    }
+
+    long long symbolId = info->id;
+    if (symbolId == 0) {
+            Utils::Notify(Utils::UserMessageType::Error,
+                          "ORDER",
+                          "Symbol ID unavailable for order placement");
+        return 0;
+    }
+
+    int absAmount = abs(amount);
+    if (absAmount == 0) return 0;
+
+    int tradeSide = (amount > 0) ? 1 : 2; // 1=BUY, 2=SELL
+
+    // Convert Zorro internal amount to standard lots, then to cTrader cents using symbol-specific lotSize
+    double standardLots = static_cast<double>(absAmount) / 100000.0;
+    long long volumeInCents = static_cast<long long>(standardLots * static_cast<double>(info->lotSize));
+
+    char volDebug[256];
+    sprintf_s(volDebug, "Volume conversion: absAmount=%d -> standardLots=%.5f -> volumeInCents=%lld (lotSize=%lld)",
+              absAmount, standardLots, volumeInCents, info->lotSize);
+    Utils::LogToFile("VOLUME_CALC", volDebug);
+
+    double priceScale = std::pow(10.0, info->digits > 0 ? info->digits : 5);
+    double marketBid = (info->bid > 0) ? static_cast<double>(info->bid) / priceScale : 0.0;
+    double marketAsk = (info->ask > 0) ? static_cast<double>(info->ask) / priceScale : 0.0;
+    double referencePrice = (tradeSide == 1) ? (marketAsk > 0 ? marketAsk : marketBid) : (marketBid > 0 ? marketBid : marketAsk);
+
+    double stopPrice = 0.0;
+    if (stopDist > 0 && referencePrice > 0.0) {
+        stopPrice = (tradeSide == 1) ? (referencePrice - stopDist) : (referencePrice + stopDist);
+    }
+
+    double takeProfitPrice = (limit > 0) ? limit : 0.0;
+
+    std::string clientMsgId = Utils::GetMsgId();
+    int zorroTradeId = 0;
+
+    {
+        EnterCriticalSection(&G.cs_trades);
+        zorroTradeId = G.nextTradeId++;
+        G.pendingTrades[clientMsgId] = zorroTradeId;
+        G.pendingTradeInfo[zorroTradeId] = std::make_pair(std::string(symbol),
+                                                          (amount > 0 ? 1 : -1));
+
+        PendingAction action{};
+        action.type = PendingActionType::NewOrder;
+        action.zorroId = zorroTradeId;
+        action.volume = amount;
+        action.stopLoss = stopPrice;
+        action.takeProfit = takeProfitPrice;
+        action.orderId = 0;
+        action.positionId = 0;
+        action.sentTimeMs = GetTickCount64();
+        G.pendingActions[clientMsgId] = action;
+        LeaveCriticalSection(&G.cs_trades);
+    }
+
+    // Build request with Stop Loss and Take Profit support
+    char request[1024];
+    std::string stopLossStr;
+    if (stopPrice > 0.0) {
+        char stopBuf[64];
+        sprintf_s(stopBuf, ",\"stopLoss\":%.5f", stopPrice);
+        stopLossStr = stopBuf;
+    }
+
+    std::string takeProfitStr;
+    if (takeProfitPrice > 0.0) {
+        char takeBuf[64];
+        sprintf_s(takeBuf, ",\"takeProfit\":%.5f", takeProfitPrice);
+        takeProfitStr = takeBuf;
+    }
+
+    sprintf_s(request,
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":"
+        "{\"ctidTraderAccountId\":%lld,"
+        "\"symbolId\":%lld,\"orderType\":1,\"tradeSide\":%d,\"volume\":%lld%s%s}}",
+        clientMsgId.c_str(),
+        ToInt(PayloadType::NewOrderReq),
+        G.CTraderAccountId, symbolId,
+        tradeSide, volumeInCents, stopLossStr.c_str(), takeProfitStr.c_str());
+
+    if (!Network::Send(request)) {
+        EnterCriticalSection(&G.cs_trades);
+        G.pendingTrades.erase(clientMsgId);
+        G.pendingTradeInfo.erase(zorroTradeId);
+        G.pendingActions.erase(clientMsgId);
+        LeaveCriticalSection(&G.cs_trades);
+            Utils::Notify(Utils::UserMessageType::Error,"ORDER","Order send failed");
+        return 0;
+    }
+
+    // Wait for ExecutionEvent response (max 15 seconds)
+    constexpr ULONGLONG MAX_WAIT_MS = 15000;
+    constexpr ULONGLONG POLL_INTERVAL_MS = 100;
+    ULONGLONG startTime = GetTickCount64();
+    bool orderConfirmed = false;
+
+    char waitLog[256];
+    sprintf_s(waitLog, "Waiting for ExecutionEvent for order msgId=%s, zorroId=%d", clientMsgId.c_str(), zorroTradeId);
+    Utils::LogToFile("ORDER_WAIT", waitLog);
+
+    while (GetTickCount64() - startTime < MAX_WAIT_MS) {
+        EnterCriticalSection(&G.cs_trades);
+
+        // Check if order was confirmed (moved to openTrades)
+        auto it = G.openTrades.find(zorroTradeId);
+        if (it != G.openTrades.end()) {
+            orderConfirmed = true;
+            LeaveCriticalSection(&G.cs_trades);
+            break;
+        }
+
+        // Check if order was removed due to error/timeout
+        auto pendingIt = G.pendingTrades.find(clientMsgId);
+        if (pendingIt == G.pendingTrades.end()) {
+            // Order was removed (probably error or timeout)
+            LeaveCriticalSection(&G.cs_trades);
+            sprintf_s(waitLog, "Order msgId=%s removed from pending (error/timeout)", clientMsgId.c_str());
+            Utils::LogToFile("ORDER_WAIT", waitLog);
+            return 0;
+        }
+
+        LeaveCriticalSection(&G.cs_trades);
+        Sleep(POLL_INTERVAL_MS);
+    }
+
+    if (!orderConfirmed) {
+        // Timeout - clean up pending order
+        EnterCriticalSection(&G.cs_trades);
+        G.pendingTrades.erase(clientMsgId);
+        G.pendingTradeInfo.erase(zorroTradeId);
+        G.pendingActions.erase(clientMsgId);
+        LeaveCriticalSection(&G.cs_trades);
+
+        sprintf_s(waitLog, "Order timeout: msgId=%s, zorroId=%d - no ExecutionEvent after 15 seconds",
+                  clientMsgId.c_str(), zorroTradeId);
+        Utils::LogToFile("ORDER_WAIT_TIMEOUT", waitLog);
+        Utils::Notify(Utils::UserMessageType::Error, "ORDER", "Order timeout - no server response");
+        return 0;
+    }
+
+    // Order confirmed
+    sprintf_s(waitLog, "Order confirmed: msgId=%s, zorroId=%d", clientMsgId.c_str(), zorroTradeId);
+    Utils::LogToFile("ORDER_WAIT", waitLog);
+
+    if (pFill) *pFill = amount;
+    if (pPrice) *pPrice = 0;
+
+    return zorroTradeId;
+}
+
+int ClosePosition(int tradeId, int amount) {
+    if (G.CTraderAccountId == 0) {
+        Utils::LogToFile("CLOSE_POSITION", "Account id missing; rejecting close request");
+        return 0;
+    }
+
+    char beginMsg[128];
+    sprintf_s(beginMsg, "Close request received tradeId=%d amount=%d", tradeId, amount);
+    Utils::LogToFile("CLOSE_POSITION", beginMsg);
+
+    std::string clientMsgId = Utils::GetMsgId();
+    long long volumeInCents = 0;
+    long long ctid = 0;
+    int signedVolume = 0;
+
+    EnterCriticalSection(&G.cs_trades);
+    auto it = G.openTrades.find(tradeId);
+    if (it == G.openTrades.end()) {
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::LogToFile("CLOSE_POSITION", "Trade not found in openTrades");
+        // Note: Position snapshot not available (requires leverageId)
+        return 0;
+    }
+
+    Trade& t = it->second;
+    int baseAmount = (amount != 0) ? amount : t.amount;
+    int absAmount = abs(baseAmount);
+    if (absAmount == 0) {
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::LogToFile("CLOSE_POSITION", "Resolved close volume is zero; aborting");
+        return 0;
+    }
+
+    volumeInCents = static_cast<long long>(absAmount) * 100000ll;
+    ctid = t.ctid;
+    signedVolume = baseAmount;
+
+    if (ctid == 0) {
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::LogToFile("CLOSE_POSITION", "Position id not yet known");
+        // Note: Position snapshot not available (requires leverageId)
+        return 0;
+    }
+
+    t.closePending = true;
+    t.pendingCloseVolume = absAmount;
+
+    PendingAction action{};
+    action.type = PendingActionType::ClosePosition;
+    action.zorroId = tradeId;
+    action.positionId = ctid;
+    action.volume = signedVolume;
+    action.orderId = 0;
+    action.stopLoss = 0.0;
+    action.takeProfit = 0.0;
+    G.pendingActions[clientMsgId] = action;
+    LeaveCriticalSection(&G.cs_trades);
+
+    // Close position (PROTO_OA_CLOSE_POSITION_REQ)
+    char request[512];
+    sprintf_s(request,
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":"
+        "{\"ctidTraderAccountId\":%lld,"
+        "\"positionId\":%lld,\"volume\":%lld}}",
+        clientMsgId.c_str(), ToInt(PayloadType::ClosePositionReq), G.CTraderAccountId, ctid, volumeInCents);
+
+    char dispatchMsg[160];
+    sprintf_s(dispatchMsg, "Dispatching close request: positionId=%lld volume=%lld msgId=%s",
+              ctid, volumeInCents, clientMsgId.c_str());
+    Utils::LogToFile("CLOSE_POSITION", dispatchMsg);
+
+    if (!Network::Send(request)) {
+        EnterCriticalSection(&G.cs_trades);
+        auto itFail = G.openTrades.find(tradeId);
+        if (itFail != G.openTrades.end()) {
+            itFail->second.closePending = false;
+            Utils::Notify(Utils::UserMessageType::Error,
+                          "CLOSE_POSITION",
+                          "Close position failed");
+        }
+        G.pendingActions.erase(clientMsgId);
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::ShowMsg("Close position failed");
+        Utils::LogToFile("CLOSE_POSITION", "Network send failed for close request");
+        return 0;
+    }
+
+    Utils::LogToFile("CLOSE_POSITION", "Close request sent successfully");
+    return 1;
+}
+
+bool ClosePositionsByFilter(CloseFilter filter) {
+    std::vector<std::pair<int, Trade>> snapshot;
+
+    EnterCriticalSection(&G.cs_trades);
+    for (const auto& kv : G.openTrades) {
+        snapshot.emplace_back(kv.first, kv.second);
+    }
+    LeaveCriticalSection(&G.cs_trades);
+
+    std::vector<int> toClose;
+    for (const auto& entry : snapshot) {
+        const Trade& trade = entry.second;
+        double pnlEstimate = trade.closed ? trade.profit : EstimateUnrealizedPnl(trade);
+        if (ShouldCloseTrade(trade, filter, pnlEstimate)) {
+            toClose.push_back(entry.first);
+            char selMsg[160];
+            sprintf_s(selMsg, "Trade %d (%s) selected by filter %s (pnl=%.2f)",
+                      entry.first, trade.symbol.c_str(), CloseFilterName(filter), pnlEstimate);
+            Utils::LogToFile("CLOSE_FILTER", selMsg);
+        }
+    }
+
+    if (toClose.empty()) {
+        Utils::LogToFile("CLOSE_FILTER", "No trades matched close filter");
+        return false;
+    }
+
+    bool anySuccess = false;
+    for (int tradeId : toClose) {
+        if (ClosePosition(tradeId, 0)) {
+            anySuccess = true;
+        }
+    }
+
+    char summary[128];
+    sprintf_s(summary, "Close filter %s dispatched %zu trades", CloseFilterName(filter), toClose.size());
+    Utils::LogToFile("CLOSE_FILTER", summary);
+    return anySuccess;
+}
+
+int CancelOrder(int tradeId) {
+    long long orderId = 0;
+
+    std::string clientMsgId = Utils::GetMsgId();
+
+    EnterCriticalSection(&G.cs_trades);
+
+    auto oit = G.zorroIdToOrderId.find(tradeId);
+    if (oit != G.zorroIdToOrderId.end()) {
+        orderId = oit->second;
+    }
+
+    if (orderId == 0) {
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::LogToFile("CANCEL_ORDER", "OrderId missing for trade");
+        return 0;
+    }
+
+    auto tit = G.openTrades.find(tradeId);
+    if (tit != G.openTrades.end()) {
+        tit->second.cancelPending = true;
+    }
+
+    PendingAction action{};
+    action.type = PendingActionType::CancelOrder;
+    action.zorroId = tradeId;
+    action.orderId = orderId;
+    action.positionId = 0;
+    action.volume = 0;
+    action.stopLoss = 0.0;
+    action.takeProfit = 0.0;
+    G.pendingActions[clientMsgId] = action;
+
+    LeaveCriticalSection(&G.cs_trades);
+
+    char request[512];
+    sprintf_s(request,
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":"
+        "{\"ctidTraderAccountId\":%lld,\"orderId\":%lld}}",
+        clientMsgId.c_str(), ToInt(PayloadType::CancelOrderReq), G.CTraderAccountId, orderId);
+
+    if (!Network::Send(request)) {
+        EnterCriticalSection(&G.cs_trades);
+        auto titFail = G.openTrades.find(tradeId);
+        if (titFail != G.openTrades.end()) {
+            titFail->second.cancelPending = false;
+        }
+        G.pendingActions.erase(clientMsgId);
+        LeaveCriticalSection(&G.cs_trades);
+
+            Utils::Notify(Utils::UserMessageType::Error,
+                          "ORDER_CANCEL",
+                          "Cancel order failed");
+        return 0;
+    }
+
+    char msg[128];
+    sprintf_s(msg, "Cancel request sent for order %lld", orderId);
+    Utils::LogToFile("CANCEL_ORDER", msg);
+    return 1;
+}
+
+int AmendPositionSLTP(int tradeId, double newStopLoss, double newTakeProfit) {
+    std::string clientMsgId = Utils::GetMsgId();
+    long long positionId = 0;
+
+    EnterCriticalSection(&G.cs_trades);
+
+    auto it = G.openTrades.find(tradeId);
+    if (it == G.openTrades.end()) {
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::LogToFile("AMEND_ORDER", "Trade not found for amend request");
+        return 0;
+    }
+
+    Trade& t = it->second;
+    positionId = t.ctid;
+
+    if (positionId == 0) {
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::LogToFile("AMEND_ORDER", "PositionId missing for amend request");
+        return 0;
+    }
+
+    if (newStopLoss <= 0 && newTakeProfit <= 0) {
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::LogToFile("AMEND_ORDER", "Neither stop nor take profit specified");
+        return 0;
+    }
+
+    std::string extras;
+    if (newStopLoss > 0) {
+        char buf[64];
+        sprintf_s(buf, ",\"stopLoss\":%.5f", newStopLoss);
+        extras += buf;
+        t.pendingStopLoss = newStopLoss;
+    } else {
+        t.pendingStopLoss = t.stopLoss;
+    }
+    if (newTakeProfit > 0) {
+        char buf[64];
+        sprintf_s(buf, ",\"takeProfit\":%.5f", newTakeProfit);
+        extras += buf;
+        t.pendingTakeProfit = newTakeProfit;
+    } else {
+        t.pendingTakeProfit = t.takeProfit;
+    }
+
+    t.amendPending = true;
+
+    PendingAction action{};
+    action.type = PendingActionType::AmendPosition;
+    action.zorroId = tradeId;
+    action.positionId = positionId;
+    action.orderId = 0;
+    action.volume = 0;
+    action.stopLoss = newStopLoss;
+    action.takeProfit = newTakeProfit;
+    G.pendingActions[clientMsgId] = action;
+
+    LeaveCriticalSection(&G.cs_trades);
+
+    char request[512];
+    sprintf_s(request,
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":{\"ctidTraderAccountId\":%lld,\"positionId\":%lld%s}}",
+    clientMsgId.c_str(), ToInt(PayloadType::AmendPositionSltpReq), G.CTraderAccountId, positionId, extras.c_str());
+
+    if (!Network::Send(request)) {
+        EnterCriticalSection(&G.cs_trades);
+        auto itFail = G.openTrades.find(tradeId);
+        if (itFail != G.openTrades.end()) {
+            itFail->second.amendPending = false;
+        }
+        G.pendingActions.erase(clientMsgId);
+        LeaveCriticalSection(&G.cs_trades);
+
+            Utils::Notify(Utils::UserMessageType::Error,
+                          "AMEND_POSITION",
+                          "Amend position failed");
+        return 0;
+    }
+
+    Utils::LogToFile("AMEND_ORDER", "Amend SL/TP request sent via PROTO_OA_AMEND_ORDER_REQ");
+    return 1;
+}
+
+int GetTradeInfo(int tradeId, double* pOpen, double* pClose, double* pRoll, double* pProfit) {
+    EnterCriticalSection(&G.cs_trades);
+
+    auto it = G.openTrades.find(tradeId);
+    if (it == G.openTrades.end()) {
+        LeaveCriticalSection(&G.cs_trades);
+        return 0;
+    }
+
+    Trade t = it->second;
+    LeaveCriticalSection(&G.cs_trades);
+
+    if (pOpen) *pOpen = t.openPrice;
+    if (pClose) *pClose = t.closed ? t.closePrice : 0;
+    if (pRoll) *pRoll = t.swap;
+    if (pProfit) *pProfit = t.profit;
+
+    return 1;
+}
+
+bool RequestOrderSnapshot() {
+    if (G.CTraderAccountId == 0) return false;
+
+    std::string clientMsgId = Utils::GetMsgId();
+    char request[256];
+    sprintf_s(request,
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":{"
+        "\"ctidTraderAccountId\":%lld}}",
+        clientMsgId.c_str(), ToInt(PayloadType::OrderListReq), G.CTraderAccountId);
+
+    if (!Network::Send(request)) {
+        Utils::LogToFile("ORDER_SYNC", "Failed to request order snapshot");
+        return false;
+    }
+
+    Utils::LogToFile("ORDER_SYNC", "Requested order snapshot (2175)");
+    return true;
+}
+
+bool RequestPositionSnapshot() {
+    if (G.CTraderAccountId == 0) return false;
+
+    std::string clientMsgId = Utils::GetMsgId();
+    char request[256];
+    sprintf_s(request,
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":{"
+        "\"ctidTraderAccountId\":%lld}}",
+        clientMsgId.c_str(), ToInt(PayloadType::PositionListReq), G.CTraderAccountId);
+
+    if (!Network::Send(request)) {
+        Utils::LogToFile("POSITION_SYNC", "Failed to request position snapshot");
+        return false;
+    }
+
+    Utils::LogToFile("POSITION_SYNC", "Requested position snapshot (2177)");
+    return true;
+}
+
+void CheckPendingOrderTimeouts() {
+    constexpr ULONGLONG TIMEOUT_MS = 10000; // 10 second timeout
+    ULONGLONG now = GetTickCount64();
+
+    std::vector<std::string> timedOutMsgIds;
+
+    EnterCriticalSection(&G.cs_trades);
+
+    // Check all pending actions for timeouts
+    for (auto& pair : G.pendingActions) {
+        const std::string& msgId = pair.first;
+        PendingAction& action = pair.second;
+
+        if (action.type == PendingActionType::NewOrder) {
+            ULONGLONG elapsed = now - action.sentTimeMs;
+            if (elapsed > TIMEOUT_MS) {
+                char logMsg[256];
+                sprintf_s(logMsg, "Order timeout: msgId=%s, zorroId=%d, elapsed=%llums",
+                         msgId.c_str(), action.zorroId, elapsed);
+                Utils::LogToFile("ORDER_TIMEOUT", logMsg);
+
+                // Mark the order as failed by removing from pending and open trades
+                G.pendingTrades.erase(msgId);
+                G.pendingTradeInfo.erase(action.zorroId);
+
+                // Add to cleanup list
+                timedOutMsgIds.push_back(msgId);
+            }
+        }
+    }
+
+    // Clean up timed-out actions
+    for (const auto& msgId : timedOutMsgIds) {
+        G.pendingActions.erase(msgId);
+    }
+
+    LeaveCriticalSection(&G.cs_trades);
+}
+
+void HandleExecutionEvent(const char* buffer) {
+    if (!buffer) return;
+
+    char clientMsgId[64] = {0};
+    std::string clientIdStr;
+    if (extract_string(buffer, nullptr, "\"clientMsgId\":\"", clientIdStr)) {
+        strncpy_s(clientMsgId, sizeof(clientMsgId), clientIdStr.c_str(), _TRUNCATE);
+    }
+
+    std::string executionType;
+    extract_string(buffer, nullptr, "\"executionType\":\"", executionType);
+    std::string executionUpper = executionType;
+    std::transform(executionUpper.begin(), executionUpper.end(), executionUpper.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+
+    long long positionId = 0;
+    extract_long(buffer, nullptr, "\"positionId\":", positionId);
+
+    long long orderId = 0;
+    extract_long(buffer, nullptr, "\"orderId\":", orderId);
+
+    long long symbolId = 0;
+    extract_long(buffer, nullptr, "\"symbolId\":", symbolId);
+
+    long long executedVolumeRaw = 0;
+    extract_long(buffer, nullptr, "\"executedVolume\":", executedVolumeRaw);
+
+    long long remainingVolumeRaw = 0;
+    extract_long(buffer, nullptr, "\"remainingVolume\":", remainingVolumeRaw);
+
+    double executionPrice = 0.0;
+    extract_double(buffer, nullptr, "\"executionPrice\":", executionPrice);
+
+    double profit = 0.0;
+    extract_double(buffer, nullptr, "\"profit\":", profit);
+
+    double commission = 0.0;
+    extract_double(buffer, nullptr, "\"commission\":", commission);
+
+    double swap = 0.0;
+    extract_double(buffer, nullptr, "\"swap\":", swap);
+
+    double stopLossValue = 0.0;
+    extract_double(buffer, nullptr, "\"stopLoss\":", stopLossValue);
+
+    double takeProfitValue = 0.0;
+    extract_double(buffer, nullptr, "\"takeProfit\":", takeProfitValue);
+
+    int tradeSide = 0;
+    extract_int(buffer, nullptr, "\"tradeSide\":", tradeSide);
+
+    std::string symbolName;
+    extract_string(buffer, nullptr, "\"symbolName\":\"", symbolName);
+
+    std::string positionStatus;
+    extract_string(buffer, nullptr, "\"positionStatus\":\"", positionStatus);
+
+    PendingAction action{};
+    bool hasAction = false;
+
+    EnterCriticalSection(&G.cs_trades);
+
+    if (clientMsgId[0] != '\0') {
+        auto actionIt = G.pendingActions.find(clientMsgId);
+        if (actionIt != G.pendingActions.end()) {
+            action = actionIt->second;
+            hasAction = true;
+        }
+    }
+
+    int zorroId = -1;
+    auto pendingIt = (clientMsgId[0] != '\0') ? G.pendingTrades.find(clientMsgId) : G.pendingTrades.end();
+    if (pendingIt != G.pendingTrades.end()) {
+        zorroId = pendingIt->second;
+    } else if (hasAction && action.zorroId != 0) {
+        zorroId = action.zorroId;
+    }
+
+    if (zorroId == -1 && positionId > 0) {
+        auto zit = G.ctidToZorroId.find(positionId);
+        if (zit != G.ctidToZorroId.end()) {
+            zorroId = zit->second;
+        }
+    }
+
+    if (zorroId == -1 && orderId > 0) {
+        auto zit = G.orderIdToZorroId.find(orderId);
+        if (zit != G.orderIdToZorroId.end()) {
+            zorroId = zit->second;
+        }
+    }
+
+    auto clearPending = [&]() {
+        if (clientMsgId[0] != '\0') {
+            G.pendingTrades.erase(clientMsgId);
+            G.pendingActions.erase(clientMsgId);
+        }
+    };
+
+    if (executionUpper.find("REJECT") != std::string::npos) {
+        // Log rejection details before cleanup
+        char rejectLog[512];
+        if (hasAction) {
+            const char* actionType = "UNKNOWN";
+            switch (action.type) {
+                case PendingActionType::NewOrder: actionType = "NewOrder"; break;
+                case PendingActionType::ClosePosition: actionType = "ClosePosition"; break;
+                case PendingActionType::CancelOrder: actionType = "CancelOrder"; break;
+                case PendingActionType::AmendPosition: actionType = "AmendPosition"; break;
+            }
+
+            sprintf_s(rejectLog,
+                "Order REJECTED: execType=%s | Action=%s symbol=%s zorroId=%d volume=%d orderId=%lld positionId=%lld SL=%.5f TP=%.5f",
+                executionType.c_str(), actionType, symbolName.c_str(), action.zorroId, action.volume,
+                orderId, positionId, action.stopLoss, action.takeProfit);
+        } else {
+            sprintf_s(rejectLog,
+                "Order REJECTED: execType=%s | symbol=%s zorroId=%d orderId=%lld positionId=%lld msgId=%s",
+                executionType.c_str(), symbolName.c_str(), zorroId, orderId, positionId, clientMsgId);
+        }
+
+        if (zorroId != -1) {
+            G.pendingTradeInfo.erase(zorroId);
+            if (orderId > 0) {
+                G.zorroIdToOrderId.erase(zorroId);
+                G.orderIdToZorroId.erase(orderId);
+            }
+        }
+        if (orderId > 0) {
+            G.openOrders.erase(orderId);
+        }
+        clearPending();
+        LeaveCriticalSection(&G.cs_trades);
+
+        Utils::LogToFile("EXEC_EVENT", rejectLog);
+        Utils::Notify(Utils::UserMessageType::Error, "EXEC_EVENT", rejectLog);
+        return;
+    }
+
+    if (executionUpper.find("CANCEL") != std::string::npos) {
+        if (zorroId != -1) {
+            auto tit = G.openTrades.find(zorroId);
+            if (tit != G.openTrades.end()) {
+                Trade& tr = tit->second;
+                tr.cancelPending = false;
+                tr.status = executionType.empty() ? "ORDER_CANCELLED" : executionType;
+            }
+        }
+        if (orderId > 0) {
+            G.openOrders.erase(orderId);
+            G.zorroIdToOrderId.erase(zorroId);
+            G.orderIdToZorroId.erase(orderId);
+        }
+        clearPending();
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::LogToFile("EXEC_EVENT", "Order cancellation confirmed");
+        return;
+    }
+
+    if (executionUpper.find("POSITION_CLOSED") != std::string::npos || (!positionStatus.empty() && positionStatus.find("POSITION_CLOSED") != std::string::npos)) {
+        if (positionId > 0) {
+            auto zit = G.ctidToZorroId.find(positionId);
+            if (zit != G.ctidToZorroId.end()) {
+                zorroId = zit->second;
+            }
+        }
+
+        if (zorroId != -1) {
+            auto tit = G.openTrades.find(zorroId);
+            if (tit != G.openTrades.end()) {
+                Trade& tr = tit->second;
+                tr.closed = true;
+                tr.closePending = false;
+                tr.pendingCloseVolume = 0;
+                tr.closePrice = executionPrice;
+                tr.closeTime = GetTickCount64();
+                tr.profit = profit;
+                tr.commission = commission;
+                tr.swap = swap;
+                tr.status = positionStatus.empty() ? "POSITION_CLOSED" : positionStatus;
+            }
+            if (positionId > 0) {
+                G.ctidToZorroId.erase(positionId);
+            }
+            G.zorroIdToOrderId.erase(zorroId);
+        }
+
+        if (orderId > 0) {
+            G.orderIdToZorroId.erase(orderId);
+            G.openOrders.erase(orderId);
+        }
+
+        clearPending();
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::LogToFile("EXEC_EVENT", "Position close reconciled");
+        return;
+    }
+
+    if (executionUpper.find("POSITION_MODIFIED") != std::string::npos || executionUpper.find("AMEND") != std::string::npos) {
+        if (zorroId != -1) {
+            auto tit = G.openTrades.find(zorroId);
+            if (tit != G.openTrades.end()) {
+                Trade& tr = tit->second;
+                if (stopLossValue > 0.0) tr.stopLoss = stopLossValue;
+                if (takeProfitValue > 0.0) tr.takeProfit = takeProfitValue;
+                tr.amendPending = false;
+                tr.pendingStopLoss = tr.stopLoss;
+                tr.pendingTakeProfit = tr.takeProfit;
+                tr.status = positionStatus.empty() ? "POSITION_MODIFIED" : positionStatus;
+            }
+        }
+
+        clearPending();
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::LogToFile("EXEC_EVENT", "Position amend reconciled");
+        return;
+    }
+
+    if (zorroId == -1) {
+        clearPending();
+        LeaveCriticalSection(&G.cs_trades);
+        Utils::LogToFile("EXEC_EVENT", "Execution event not mapped to local trade");
+        // Note: Position snapshot not available (requires leverageId)
+        return;
+    }
+
+    Trade trade{};
+    auto existingTradeIt = G.openTrades.find(zorroId);
+    if (existingTradeIt != G.openTrades.end()) {
+        trade = existingTradeIt->second;
+    }
+    trade.zorroId = zorroId;
+    trade.ctid = positionId;
+    trade.orderId = orderId;
+    trade.symbol = symbolName;
+
+    auto infoIt = G.pendingTradeInfo.find(zorroId);
+    int directionHint = 0;
+    if (infoIt != G.pendingTradeInfo.end()) {
+        if (!infoIt->second.first.empty()) {
+            trade.symbol = infoIt->second.first;
+        }
+        directionHint = infoIt->second.second;
+    }
+
+    int executedLots = NormalizeVolume(executedVolumeRaw);
+    if (executedLots == 0) {
+        if (hasAction && action.volume != 0) {
+            executedLots = abs(action.volume);
+        } else {
+            executedLots = 1;
+        }
+    }
+
+    int remainingLots = NormalizeVolume(remainingVolumeRaw);
+
+    int direction = directionHint;
+    if (direction == 0 && tradeSide != 0) {
+        direction = (tradeSide == 2) ? -1 : 1;
+    }
+    if (direction == 0) {
+        direction = (hasAction && action.volume < 0) ? -1 : 1;
+    }
+    if (hasAction && action.volume != 0) {
+        direction = (action.volume > 0) ? 1 : -1;
+    }
+
+    trade.amount = executedLots * direction;
+    if (trade.amount == 0 && hasAction) {
+        trade.amount = action.volume;
+    }
+
+    trade.requestedVolume = hasAction ? abs(action.volume) : abs(trade.amount);
+    trade.executedVolume = abs(executedLots);
+    trade.remainingVolume = remainingLots;
+    trade.openPrice = executionPrice;
+    trade.stopLoss = (stopLossValue > 0.0) ? stopLossValue : (hasAction ? action.stopLoss : 0.0);
+    trade.takeProfit = (takeProfitValue > 0.0) ? takeProfitValue : (hasAction ? action.takeProfit : 0.0);
+    trade.pendingStopLoss = trade.stopLoss;
+    trade.pendingTakeProfit = trade.takeProfit;
+    trade.profit = profit;
+    trade.commission = commission;
+    trade.swap = swap;
+    if (trade.openTime == 0) {
+        trade.openTime = GetTickCount64();
+    }
+    trade.closeTime = 0;
+    trade.closePrice = 0;
+    trade.closed = false;
+    trade.closePending = false;
+    trade.cancelPending = false;
+    trade.amendPending = false;
+    trade.pendingCloseVolume = 0;
+    trade.status = executionType.empty() ? "ORDER_FILLED" : executionType;
+
+    G.openTrades[zorroId] = trade;
+
+    if (positionId > 0) {
+        auto insertResult = G.ctidToZorroId.insert({ positionId, zorroId });
+        if (!insertResult.second) {
+            insertResult.first->second = zorroId;
+        } else {
+            char trackMsg[160];
+            sprintf_s(trackMsg, "Tracking positionId %lld -> trade %d", positionId, zorroId);
+            Utils::LogToFile("POSITION_TRACK", trackMsg);
+        }
+    }
+
+    if (orderId > 0) {
+        G.zorroIdToOrderId[zorroId] = orderId;
+        G.orderIdToZorroId[orderId] = zorroId;
+        G.openOrders.erase(orderId);
+    }
+
+    if (infoIt != G.pendingTradeInfo.end()) {
+        G.pendingTradeInfo.erase(infoIt);
+    }
+
+    clearPending();
+    LeaveCriticalSection(&G.cs_trades);
+
+    char logMsg[256];
+    sprintf_s(logMsg, "Execution processed: execType=%s positionId=%lld orderId=%lld zorroId=%d", executionType.c_str(), positionId, orderId, zorroId);
+    Utils::LogToFile("EXEC_EVENT", logMsg);
+}
+
+void HandleOrderErrorEvent(const char* buffer) {
+    if (!buffer) return;
+
+    char clientMsgId[64] = {0};
+    std::string clientIdStr;
+    if (extract_string(buffer, nullptr, "\"clientMsgId\":\"", clientIdStr)) {
+        strncpy_s(clientMsgId, sizeof(clientMsgId), clientIdStr.c_str(), _TRUNCATE);
+    }
+
+    int errorCode = 0;
+    extract_int(buffer, nullptr, "\"errorCode\":", errorCode);
+
+    std::string description;
+    extract_string(buffer, nullptr, "\"description\":\"", description);
+
+    PendingAction action{};
+    bool hasAction = false;
+
+    EnterCriticalSection(&G.cs_trades);
+
+    if (clientMsgId[0] != '\0') {
+        auto actionIt = G.pendingActions.find(clientMsgId);
+        if (actionIt != G.pendingActions.end()) {
+            action = actionIt->second;
+            hasAction = true;
+        }
+    }
+
+    if (hasAction) {
+        switch (action.type) {
+        case PendingActionType::NewOrder:
+            if (action.zorroId != 0) {
+                G.pendingTradeInfo.erase(action.zorroId);
+                G.openTrades.erase(action.zorroId);
+                G.zorroIdToOrderId.erase(action.zorroId);
+            }
+            if (action.orderId > 0) {
+                G.openOrders.erase(action.orderId);
+                G.orderIdToZorroId.erase(action.orderId);
+            }
+            break;
+        case PendingActionType::ClosePosition: {
+            auto it = G.openTrades.find(action.zorroId);
+            if (it != G.openTrades.end()) {
+                it->second.closePending = false;
+                it->second.pendingCloseVolume = 0;
+            }
+            break;
+        }
+        case PendingActionType::CancelOrder: {
+            auto it = G.openTrades.find(action.zorroId);
+            if (it != G.openTrades.end()) {
+                it->second.cancelPending = false;
+            }
+            if (action.orderId > 0) {
+                G.openOrders.erase(action.orderId);
+            }
+            break;
+        }
+        case PendingActionType::AmendPosition: {
+            auto it = G.openTrades.find(action.zorroId);
+            if (it != G.openTrades.end()) {
+                Trade& tr = it->second;
+                tr.amendPending = false;
+                tr.pendingStopLoss = tr.stopLoss;
+                tr.pendingTakeProfit = tr.takeProfit;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    if (clientMsgId[0] != '\0') {
+        G.pendingTrades.erase(clientMsgId);
+        G.pendingActions.erase(clientMsgId);
+    }
+
+    LeaveCriticalSection(&G.cs_trades);
+
+    // Enhanced error logging with order details
+    char logMsg[512];
+    if (hasAction) {
+        const char* actionType = "UNKNOWN";
+        switch (action.type) {
+            case PendingActionType::NewOrder: actionType = "NewOrder"; break;
+            case PendingActionType::ClosePosition: actionType = "ClosePosition"; break;
+            case PendingActionType::CancelOrder: actionType = "CancelOrder"; break;
+            case PendingActionType::AmendPosition: actionType = "AmendPosition"; break;
+        }
+
+        sprintf_s(logMsg,
+            "Order error (code=%d): %s | Action=%s zorroId=%d volume=%d orderId=%lld positionId=%lld SL=%.5f TP=%.5f",
+            errorCode, description.c_str(), actionType, action.zorroId, action.volume,
+            action.orderId, action.positionId, action.stopLoss, action.takeProfit);
+    } else {
+        sprintf_s(logMsg, "Order error (code=%d): %s | No pending action found (msgId=%s)",
+            errorCode, description.c_str(), clientMsgId);
+    }
+
+    Utils::LogToFile("ORDER_ERROR", logMsg);
+    Utils::Notify(Utils::UserMessageType::Error, "ORDER_ERROR", logMsg);
+}
+
+void HandleOrderListResponse(const char* buffer) {
+    if (!buffer) return;
+
+    const char* arrayPos = strstr(buffer, "\"orders\":[");
+    if (!arrayPos) {
+        Utils::LogToFile("ORDER_SYNC", "Order list payload missing 'orders'");
+        return;
+    }
+
+    const char* cursor = strchr(arrayPos, '[');
+    if (!cursor) return;
+    cursor++;
+
+    std::map<long long, OrderRecord> snapshot;
+
+    EnterCriticalSection(&G.cs_trades);
+
+    while (*cursor) {
+        if (*cursor == '{') {
+            const char* objStart = cursor;
+            int depth = 1;
+            const char* walk = cursor + 1;
+            while (*walk && depth > 0) {
+                if (*walk == '{') depth++;
+                else if (*walk == '}') depth--;
+                walk++;
+            }
+            if (depth != 0) break;
+            const char* objEnd = walk;
+
+            long long orderId = 0;
+            extract_long(objStart, objEnd, "\"orderId\":", orderId);
+
+            long long volumeRaw = 0;
+            extract_long(objStart, objEnd, "\"volume\":", volumeRaw);
+
+            int tradeSide = 0;
+            extract_int(objStart, objEnd, "\"tradeSide\":", tradeSide);
+
+            double limitPrice = 0.0;
+            extract_double(objStart, objEnd, "\"limitPrice\":", limitPrice);
+
+            double stopLoss = 0.0;
+            extract_double(objStart, objEnd, "\"stopLoss\":", stopLoss);
+
+            double takeProfit = 0.0;
+            extract_double(objStart, objEnd, "\"takeProfit\":", takeProfit);
+
+            std::string symbolName;
+            extract_string(objStart, objEnd, "\"symbolName\":\"", symbolName);
+
+            std::string orderStatus;
+            extract_string(objStart, objEnd, "\"orderStatus\":\"", orderStatus);
+
+            OrderRecord record{};
+            record.orderId = orderId;
+            record.symbol = symbolName;
+            record.volume = NormalizeVolume(volumeRaw);
+            if (tradeSide == 2) record.volume *= -1;
+            record.tradeSide = tradeSide;
+            record.orderStatus = orderStatus;
+            record.limitPrice = limitPrice;
+            record.stopLoss = stopLoss;
+            record.takeProfit = takeProfit;
+            long long now = GetTickCount64();
+            auto existing = G.openOrders.find(orderId);
+            if (existing != G.openOrders.end()) {
+                record.createdTime = existing->second.createdTime;
+            } else {
+                record.createdTime = now;
+            }
+            record.updatedTime = now;
+
+            if (orderId != 0) {
+                snapshot[orderId] = record;
+            }
+
+            cursor = objEnd;
+        } else if (*cursor == ']') {
+            cursor++;
+            break;
+        } else {
+            cursor++;
+        }
+    }
+
+    G.openOrders.swap(snapshot);
+
+    LeaveCriticalSection(&G.cs_trades);
+
+    Utils::LogToFile("ORDER_SYNC", "Order snapshot applied");
+}
+
+void HandlePositionListResponse(const char* buffer) {
+    if (!buffer) return;
+
+    const char* arrayPos = strstr(buffer, "\"positions\":[");
+    if (!arrayPos) {
+        Utils::LogToFile("POSITION_SYNC", "Position list payload missing 'positions'");
+        return;
+    }
+
+    const char* cursor = strchr(arrayPos, '[');
+    if (!cursor) return;
+    cursor++;
+
+    std::map<int, Trade> newTrades;
+    std::map<long long, int> newCtidToZorro;
+    std::map<int, long long> newZorroToOrder;
+    std::map<long long, int> newOrderToZorro;
+
+    EnterCriticalSection(&G.cs_trades);
+
+    while (*cursor) {
+        if (*cursor == '{') {
+            const char* objStart = cursor;
+            int depth = 1;
+            const char* walk = cursor + 1;
+            while (*walk && depth > 0) {
+                if (*walk == '{') depth++;
+                else if (*walk == '}') depth--;
+                walk++;
+            }
+            if (depth != 0) break;
+            const char* objEnd = walk;
+
+            long long positionId = 0;
+            extract_long(objStart, objEnd, "\"positionId\":", positionId);
+
+            long long orderId = 0;
+            extract_long(objStart, objEnd, "\"orderId\":", orderId);
+
+            long long volumeRaw = 0;
+            extract_long(objStart, objEnd, "\"volume\":", volumeRaw);
+
+            double entryPrice = 0.0;
+            extract_double(objStart, objEnd, "\"entryPrice\":", entryPrice);
+
+            double stopLoss = 0.0;
+            extract_double(objStart, objEnd, "\"stopLoss\":", stopLoss);
+
+            double takeProfit = 0.0;
+            extract_double(objStart, objEnd, "\"takeProfit\":", takeProfit);
+
+            double profit = 0.0;
+            extract_double(objStart, objEnd, "\"profit\":", profit);
+            profit /= 100.0;  // Descale from cents
+
+            double commission = 0.0;
+            extract_double(objStart, objEnd, "\"commission\":", commission);
+            commission /= 100.0;  // Descale from cents
+
+            double swap = 0.0;
+            extract_double(objStart, objEnd, "\"swap\":", swap);
+            swap /= 100.0;  // Descale from cents
+
+            int tradeSide = 0;
+            extract_int(objStart, objEnd, "\"tradeSide\":", tradeSide);
+
+            std::string symbolName;
+            extract_string(objStart, objEnd, "\"symbolName\":\"", symbolName);
+
+            int zorroId = -1;
+            if (positionId > 0) {
+                auto zit = G.ctidToZorroId.find(positionId);
+                if (zit != G.ctidToZorroId.end()) {
+                    zorroId = zit->second;
+                }
+            }
+
+            if (zorroId == -1) {
+                zorroId = G.nextTradeId++;
+            }
+
+            int lots = NormalizeVolume(volumeRaw);
+            if (tradeSide == 2) {
+                lots *= -1;
+            }
+
+            Trade trade{};
+            trade.zorroId = zorroId;
+            trade.ctid = positionId;
+            trade.orderId = orderId;
+            trade.symbol = symbolName;
+            trade.amount = lots;
+            trade.requestedVolume = abs(lots);
+            trade.executedVolume = abs(lots);
+            trade.remainingVolume = 0;
+            trade.openPrice = entryPrice;
+            trade.stopLoss = stopLoss;
+            trade.takeProfit = takeProfit;
+            trade.pendingStopLoss = stopLoss;
+            trade.pendingTakeProfit = takeProfit;
+            trade.profit = profit;
+            trade.commission = commission;
+            trade.swap = swap;
+            trade.openTime = GetTickCount64();
+            trade.closeTime = 0;
+            trade.closePrice = 0;
+            trade.closed = false;
+            trade.closePending = false;
+            trade.cancelPending = false;
+            trade.amendPending = false;
+            trade.pendingCloseVolume = 0;
+            trade.status = "POSITION_SYNC";
+
+            auto existing = G.openTrades.find(zorroId);
+            if (existing != G.openTrades.end()) {
+                const Trade& prev = existing->second;
+                if (!prev.symbol.empty()) trade.symbol = prev.symbol;
+                if (prev.openTime != 0) trade.openTime = prev.openTime;
+                trade.closePending = prev.closePending;
+                trade.cancelPending = prev.cancelPending;
+                trade.amendPending = prev.amendPending;
+                trade.pendingCloseVolume = prev.pendingCloseVolume;
+                if (prev.pendingStopLoss != 0.0) trade.pendingStopLoss = prev.pendingStopLoss;
+                if (prev.pendingTakeProfit != 0.0) trade.pendingTakeProfit = prev.pendingTakeProfit;
+            }
+
+            if (trade.pendingStopLoss == 0.0) trade.pendingStopLoss = trade.stopLoss;
+            if (trade.pendingTakeProfit == 0.0) trade.pendingTakeProfit = trade.takeProfit;
+
+            newTrades[zorroId] = trade;
+
+            if (positionId > 0) {
+                newCtidToZorro[positionId] = zorroId;
+                char trackMsg[160];
+                sprintf_s(trackMsg, "Snapshot positionId %lld -> trade %d", positionId, zorroId);
+                Utils::LogToFile("POSITION_TRACK", trackMsg);
+            }
+
+            if (orderId > 0) {
+                newZorroToOrder[zorroId] = orderId;
+                newOrderToZorro[orderId] = zorroId;
+            }
+
+            cursor = objEnd;
+        } else if (*cursor == ']') {
+            cursor++;
+            break;
+        } else {
+            cursor++;
+        }
+    }
+
+    G.openTrades.swap(newTrades);
+    G.ctidToZorroId.swap(newCtidToZorro);
+    G.zorroIdToOrderId.swap(newZorroToOrder);
+    G.orderIdToZorroId.swap(newOrderToZorro);
+
+    LeaveCriticalSection(&G.cs_trades);
+
+    Utils::LogToFile("POSITION_SYNC", "Position snapshot applied");
+}
+
+} // namespace Trading
+
