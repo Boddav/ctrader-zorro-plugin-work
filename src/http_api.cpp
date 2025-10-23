@@ -4,11 +4,47 @@
 #include <winhttp.h>
 #include <string>
 #include <map>
+#include <mutex>
+#include <thread>
+#include <chrono>
 
 namespace HttpApi {
 
+namespace {
+    constexpr auto REQUEST_COOLDOWN = std::chrono::milliseconds(500);
+    std::mutex g_rateMutex;
+    std::chrono::steady_clock::time_point g_lastRequest;
+
+    void ApplyRateLimit() {
+        std::chrono::steady_clock::duration sleepDuration{0};
+        {
+            std::lock_guard<std::mutex> lock(g_rateMutex);
+            auto now = std::chrono::steady_clock::now();
+            if (g_lastRequest.time_since_epoch().count() == 0) {
+                g_lastRequest = now;
+                return;
+            }
+
+            auto earliest = g_lastRequest + REQUEST_COOLDOWN;
+            if (now < earliest) {
+                sleepDuration = earliest - now;
+                g_lastRequest = earliest;
+            } else {
+                g_lastRequest = now;
+            }
+        }
+
+        if (sleepDuration > std::chrono::steady_clock::duration::zero()) {
+            Utils::LogToFile("HTTP_RATE_LIMIT", "Cooldown active, sleeping before next request");
+            std::this_thread::sleep_for(sleepDuration);
+        }
+    }
+}
+
 std::string HttpRequest(const char* url, const char* data, const char* headers, const char* method) {
     if (!url) return "";
+
+    ApplyRateLimit();
 
     std::string response;
 
@@ -177,3 +213,4 @@ std::string GetPositions(long long accountId) {
 }
 
 } // namespace HttpApi
+

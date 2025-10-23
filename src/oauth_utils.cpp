@@ -140,4 +140,52 @@ bool PerformInteractiveFlow() {
     return true;
 }
 
+// Additional functions from grok2.txt integration
+
+std::string UrlEncode(const std::string& str) {
+    std::string encoded;
+    char hex[4];
+
+    for (size_t i = 0; i < str.length(); ++i) {
+        unsigned char c = static_cast<unsigned char>(str[i]);
+
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded += c;
+        }
+        else {
+            sprintf_s(hex, sizeof(hex), "%%%02X", c);
+            encoded += hex;
+        }
+    }
+
+    return encoded;
 }
+
+std::string ExtractAuthCode(const std::string& callbackUrl) {
+    const char* pCode = strstr(callbackUrl.c_str(), "code=");
+    if (!pCode) return "";
+
+    pCode += 5; // Skip "code="
+    const char* pEnd = strstr(pCode, "&");
+    if (!pEnd) pEnd = strstr(pCode, " ");
+    if (!pEnd) pEnd = strstr(pCode, "\r");
+    if (!pEnd) pEnd = strstr(pCode, "\n");
+
+    if (pEnd) {
+        return std::string(pCode, pEnd - pCode);
+    } else {
+        return std::string(pCode);
+    }
+}
+
+std::string GenerateAuthUrl(const std::string& clientId, const std::string& redirectUri, const std::string& scope) {
+    std::string url = "https://openapi.ctrader.com/apps/auth";
+    url += "?client_id=" + UrlEncode(clientId);
+    url += "&redirect_uri=" + UrlEncode(redirectUri);
+    url += "&scope=" + UrlEncode(scope);
+    url += "&response_type=code";
+    return url;
+}
+
+} // namespace OAuth
+

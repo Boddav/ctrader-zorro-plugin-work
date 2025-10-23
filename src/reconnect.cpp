@@ -11,11 +11,11 @@ bool AuthenticateAfterConnect() {
     char response[131072] = {0};
 
     sprintf_s(request,
-        "{\"clientMsgId\":\"%s\",\"payloadType\":2100,\"payload\":{\"clientId\":\"%s\",\"clientSecret\":\"%s\"}}",
-        Utils::GetMsgId(), G.ClientId, G.ClientSecret);
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":{\"clientId\":\"%s\",\"clientSecret\":\"%s\"}}",
+        Utils::GetMsgId(), ToInt(PayloadType::ApplicationAuthReq), G.ClientId, G.ClientSecret);
 
     if (!Network::Send(request) || Network::Receive(response, sizeof(response)) <= 0 ||
-        !strstr(response, "\"payloadType\":2101")) {
+        !Utils::ContainsPayloadType(response, PayloadType::ApplicationAuthRes)) {
         return false;
     }
 
@@ -23,11 +23,11 @@ bool AuthenticateAfterConnect() {
     ZeroMemory(response, sizeof(response));
 
     sprintf_s(request,
-        "{\"clientMsgId\":\"%s\",\"payloadType\":2102,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld}}",
-        Utils::GetMsgId(), G.Token, G.CTraderAccountId);
+        "{\"clientMsgId\":\"%s\",\"payloadType\":%d,\"payload\":{\"accessToken\":\"%s\",\"ctidTraderAccountId\":%lld}}",
+        Utils::GetMsgId(), ToInt(PayloadType::AccountAuthReq), G.Token, G.CTraderAccountId);
 
     if (!Network::Send(request) || Network::Receive(response, sizeof(response)) <= 0 ||
-        !strstr(response, "\"payloadType\":2103")) {
+        !Utils::ContainsPayloadType(response, PayloadType::AccountAuthRes)) {
         return false;
     }
 
@@ -35,14 +35,36 @@ bool AuthenticateAfterConnect() {
 }
 
 void ResubscribeSymbols() {
+    // Reset quote counter and restart subscription timer
+    G.quoteCount = 0;
+    G.subscriptionStartMs = GetTickCount64();
+    
     Symbols::BatchResubscribe(G.CTraderAccountId);
+    Symbols::BatchResubscribeDepth(G.CTraderAccountId, 10);
 }
 
 bool Attempt(int maxRetries) {
     Utils::ShowMsg("Reconnecting...");
     Network::Disconnect();
 
-    const char* host = (G.Env == CtraderEnv::Live) ? CTRADER_HOST_LIVE : CTRADER_HOST_DEMO;
+    // Debug: Log the environment for reconnection
+    char envMsg[256];
+    sprintf_s(envMsg, "Reconnecting with environment: %s",
+             (G.Env == CtraderEnv::Live) ? "LIVE" : "DEMO");
+    Utils::LogToFile("RECONNECT_ENV", envMsg);
+
+    // Use the persistent G.Env and any explicit host override for reconnection
+    const char* host = nullptr;
+    if (!G.hostOverride.empty()) {
+        host = G.hostOverride.c_str();
+    } else {
+        host = (G.Env == CtraderEnv::Live) ? CTRADER_HOST_LIVE : CTRADER_HOST_DEMO;
+    }
+
+    // Debug: Log the host being used for reconnection
+    char hostMsg[256];
+    sprintf_s(hostMsg, "Reconnecting to host: %s (using persistent env)", host);
+    Utils::LogToFile("RECONNECT_HOST", hostMsg);
 
     for (int attempt = 0; attempt < maxRetries; ++attempt) {
         char msg[128];
@@ -53,7 +75,11 @@ bool Attempt(int maxRetries) {
 
         if (Network::Connect(host, "5036") && AuthenticateAfterConnect()) {
             ResubscribeSymbols();
-            Utils::ShowMsg("Reconnected!");
+            G.snapshotsRequested = false;
+            G.cashFlowRequested = false;
+            G.cashFlowHydrated = false;
+            G.assetMetadataRequested = false;
+            Utils::Notify(Utils::UserMessageType::Success, "RECONNECT", "Reconnected!");
             return true;
         }
     }
@@ -62,3 +88,4 @@ bool Attempt(int maxRetries) {
 }
 
 }
+

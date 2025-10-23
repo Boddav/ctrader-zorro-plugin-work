@@ -1,7 +1,12 @@
+#include "../stdafx.h"
 #include "../include/network.h"
 #include "../include/utils.h"
 
 namespace Network {
+
+// Static variables for error tracking
+static std::string lastError;
+static DWORD receiveTimeoutMs = 5000; // Default 5 second timeout
 
 bool Connect(const char* host, const char* /*portStr*/) {
     // Close any previous handles
@@ -17,6 +22,11 @@ bool Connect(const char* host, const char* /*portStr*/) {
     if (!G.hSession) {
         Utils::ShowMsg("WinHTTP open failed");
         return false;
+    }
+
+    // Set timeouts to make WebSocket receive non-blocking
+    if (!WinHttpSetTimeouts(G.hSession, 10000, 10000, 5000, 2000)) {
+        Utils::ShowMsg("Failed to set WinHTTP timeouts");
     }
 
     G.hConnect = WinHttpConnect(G.hSession, whost.c_str(), CTRADER_WS_PORT, 0);
@@ -35,10 +45,11 @@ bool Connect(const char* host, const char* /*portStr*/) {
 
     // Upgrade to WebSocket: pass NULL and 0 as per WinHTTP docs
     if (!WinHttpSetOption(hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0)) {
-        DWORD err = GetLastError();
+        DWORD dwErr = ::GetLastError();
         char emsg[128];
-        sprintf_s(emsg, "WinHTTP set upgrade option failed (err=%lu)", err);
+        sprintf_s(emsg, "WinHTTP set upgrade option failed (err=%lu)", dwErr);
         Utils::ShowMsg(emsg);
+        lastError = emsg;
         WinHttpCloseHandle(hRequest);
         Disconnect();
         return false;
@@ -46,10 +57,11 @@ bool Connect(const char* host, const char* /*portStr*/) {
 
     if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(hRequest, NULL)) {
-        DWORD err = GetLastError();
+        DWORD dwErr = ::GetLastError();
         char emsg[128];
-        sprintf_s(emsg, "WinHTTP send/receive failed (err=%lu)", err);
+        sprintf_s(emsg, "WinHTTP send/receive failed (err=%lu)", dwErr);
         Utils::ShowMsg(emsg);
+        lastError = emsg;
         WinHttpCloseHandle(hRequest);
         Disconnect();
         return false;
@@ -102,7 +114,7 @@ bool Send(const char* data) {
     return true;
 }
 
-int Receive(char* buffer, int len) {
+int Receive(char* buffer, size_t size) {
     if (!G.wsConnected || !G.hWebSocket) return -1;
 
     std::string accum;
@@ -118,11 +130,15 @@ int Receive(char* buffer, int len) {
 
         HRESULT hr = WinHttpWebSocketReceive(G.hWebSocket, tmp, sizeof(tmp), &dwRead, &type);
         if (hr != S_OK) {
+            char errMsg[256];
+            sprintf_s(errMsg, "WinHttpWebSocketReceive failed with HRESULT: 0x%08X", hr);
+            Utils::LogToFile("WS_RECEIVE_ERROR", errMsg);
             Disconnect();
             return -1;
         }
 
         if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
+            Utils::LogToFile("WS_CLOSE", "Received CLOSE_BUFFER_TYPE from server");
             Disconnect();
             return -1;
         }
@@ -134,7 +150,7 @@ int Receive(char* buffer, int len) {
 
     if (accum.empty()) return 0;
 
-    int copy = (int)std::min(accum.size(), (size_t)(len-1));
+    int copy = (int)std::min(accum.size(), (size_t)(size-1));
     memcpy(buffer, accum.data(), copy);
     buffer[copy] = '\0';
 
@@ -143,4 +159,26 @@ int Receive(char* buffer, int len) {
     return copy;
 }
 
+// Additional enhanced functions from grok2.txt
+
+bool Connect(const char* host, int port) {
+    char portStr[16];
+    sprintf_s(portStr, "%d", port);
+    return Connect(host, portStr);
+}
+
+bool IsConnected() {
+    return G.wsConnected && G.hWebSocket != NULL;
+}
+
+std::string GetLastError() {
+    return lastError;
+}
+
+void SetReceiveTimeout(DWORD timeoutMs) {
+    receiveTimeoutMs = timeoutMs;
+    Utils::LogToFile("NETWORK", ("Receive timeout set to " + std::to_string(timeoutMs) + "ms").c_str());
+}
+
 } // namespace Network
+

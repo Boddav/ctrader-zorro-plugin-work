@@ -196,23 +196,32 @@ bool LoadAccountsCsv(CsvCreds& out, const char* hintAccountOrUser, const char* t
         }
         if(!typeOk) continue;
 
-        selected.clientId=user;
-        selected.clientSecret=pass;
-        selected.accountId=accountId;
-        selected.type = !type.empty()?type:(!zorroName.empty()?zorroName:(atoi(realFlag.c_str())?"Live":"Demo"));
-        selected.accessToken=token;
+        CsvCreds candidate{};
+        candidate.clientId = user;
+        candidate.clientSecret = pass;
+        candidate.accountId = accountId;
+        candidate.type = !type.empty() ? type : (!zorroName.empty() ? zorroName : (atoi(realFlag.c_str()) ? "Live" : "Demo"));
+        candidate.accessToken = token;
+        candidate.server = server;
 
-        if (!redirectUri.empty()) {
-            strncpy_s(G.RedirectUri, sizeof(G.RedirectUri), redirectUri.c_str(), _TRUNCATE);
-        }
-        if (!scope.empty()) {
-            strncpy_s(G.Scope, sizeof(G.Scope), scope.c_str(), _TRUNCATE);
-        }
-        if (!product.empty()) {
-            strncpy_s(G.Product, sizeof(G.Product), product.c_str(), _TRUNCATE);
+        if (!realFlag.empty()) {
+            int rf = atoi(realFlag.c_str());
+            candidate.hasExplicitEnv = true;
+            candidate.explicitEnv = rf ? CtraderEnv::Live : CtraderEnv::Demo;
         }
 
-        if(!selected.clientId.empty() && !selected.clientSecret.empty() && !selected.accountId.empty()) {
+        if(!candidate.clientId.empty() && !candidate.clientSecret.empty() && !candidate.accountId.empty()) {
+            if (!redirectUri.empty()) {
+                strncpy_s(G.RedirectUri, sizeof(G.RedirectUri), redirectUri.c_str(), _TRUNCATE);
+            }
+            if (!scope.empty()) {
+                strncpy_s(G.Scope, sizeof(G.Scope), scope.c_str(), _TRUNCATE);
+            }
+            if (!product.empty()) {
+                strncpy_s(G.Product, sizeof(G.Product), product.c_str(), _TRUNCATE);
+            }
+
+            selected = candidate;
             found=true;
             break;
         }
@@ -227,3 +236,4 @@ bool LoadAccountsCsv(CsvCreds& out, const char* hintAccountOrUser, const char* t
 }
 
 }
+

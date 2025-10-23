@@ -60,7 +60,7 @@ bool BodyIndicatesError(const std::string& body, const char* extraTag) {
         }
         return false; // null
     }
-    // Non-null literal (number / word) – treat non-zero / non-null token as error
+    // Non-null literal (number / word) � treat non-zero / non-null token as error
     if (extraTag && *extraTag && body.find(extraTag) != std::string::npos) return true;
     return true;
 }
@@ -270,7 +270,7 @@ bool RefreshAccessToken() {
     return true;
 }
 
-bool FetchAccountsList(std::vector<long long>& accountIds) {
+bool FetchAccountsList(std::vector<long long>& accountIds, CtraderEnv requestedEnv) {
     accountIds.clear();
 
     // Use REST API instead of WebSocket for account detection
@@ -343,27 +343,107 @@ bool FetchAccountsList(std::vector<long long>& accountIds) {
         return false;
     }
 
+    // Store original environment preference from parameter
+    CtraderEnv originalEnv = requestedEnv;
+    std::vector<long long> liveAccounts;
+    std::vector<long long> demoAccounts;
+
     const char* current = dataStart;
     while ((current = strstr(current, "\"accountId\":"))) {
         long long aid = 0;
         if (sscanf_s(current, "\"accountId\":%lld", &aid) == 1 && aid > 0) {
-            // Check for duplicates
-            bool dup = false;
-            for (size_t i = 0; i < accountIds.size(); ++i) {
-                if (accountIds[i] == aid) {
-                    dup = true;
-                    break;
+
+            // Parse the "live" flag for this account
+            const char* liveStart = strstr(current, "\"live\":");
+            bool isLiveAccount = false;
+            if (liveStart) {
+                // Find the next account boundary or end of current account object
+                const char* nextAccount = strstr(current + 15, "\"accountId\":");
+                const char* endBoundary = nextAccount ? nextAccount : (current + strlen(current));
+
+                // Check if "live":true is within this account's data
+                if (liveStart < endBoundary) {
+                    const char* truePos = strstr(liveStart, "\"live\":true");
+                    const char* falsePos = strstr(liveStart, "\"live\":false");
+
+                    if (truePos && truePos < endBoundary) {
+                        isLiveAccount = true;
+                    } else if (falsePos && falsePos < endBoundary) {
+                        isLiveAccount = false;
+                    }
                 }
             }
-            if (!dup) {
-                accountIds.push_back(aid);
-                char msg[128];
-                sprintf_s(msg, "Found account ID: %lld", aid);
-                Utils::LogToFile("ACCOUNT_FOUND", msg);
+
+            // Log account environment info
+            char envMsg[256];
+            sprintf_s(envMsg, "Account %lld is %s environment", aid, isLiveAccount ? "LIVE" : "DEMO");
+            Utils::LogToFile("ACCOUNT_ENV_DETECT", envMsg);
+
+            // Categorize accounts by environment
+            if (isLiveAccount) {
+                liveAccounts.push_back(aid);
+            } else {
+                demoAccounts.push_back(aid);
             }
+
+            char msg[128];
+            sprintf_s(msg, "Found account ID: %lld (%s)", aid, isLiveAccount ? "LIVE" : "DEMO");
+            Utils::LogToFile("ACCOUNT_FOUND", msg);
         }
         current++;
     }
+
+    bool envLocked = G.envLocked;
+
+    // Environment selection based on account detection
+    if (envLocked) {
+        if (requestedEnv == CtraderEnv::Live) {
+            if (liveAccounts.empty()) {
+                Utils::LogToFile("ENV_SELECTION_FAIL", "Forced LIVE environment has no available accounts");
+                Utils::ShowMsg("Error: No live accounts available for requested environment");
+                return false;
+            }
+            accountIds = liveAccounts;
+            G.Env = CtraderEnv::Live;
+            Utils::LogToFile("ENV_SELECTION", "Using LIVE environment - forced by Zorro Type parameter");
+        } else {
+            if (demoAccounts.empty()) {
+                Utils::LogToFile("ENV_SELECTION_FAIL", "Forced DEMO environment has no available accounts");
+                Utils::ShowMsg("Error: No demo accounts available for requested environment");
+                return false;
+            }
+            accountIds = demoAccounts;
+            G.Env = CtraderEnv::Demo;
+            Utils::LogToFile("ENV_SELECTION", "Using DEMO environment - forced by Zorro Type parameter");
+        }
+    } else if (!liveAccounts.empty() && !demoAccounts.empty()) {
+        // We have both types - use the requested environment
+        if (originalEnv == CtraderEnv::Live) {
+            accountIds = liveAccounts;
+            G.Env = CtraderEnv::Live;
+            Utils::LogToFile("ENV_SELECTION", "Using LIVE environment - live accounts found and requested");
+        } else {
+            accountIds = demoAccounts;
+            G.Env = CtraderEnv::Demo;
+            Utils::LogToFile("ENV_SELECTION", "Using DEMO environment - demo accounts found and requested");
+        }
+    } else if (!liveAccounts.empty()) {
+        // Only live accounts available - must use live
+        accountIds = liveAccounts;
+        G.Env = CtraderEnv::Live;
+        Utils::LogToFile("ENV_SELECTION", "Using LIVE environment - only live accounts available");
+    } else if (!demoAccounts.empty()) {
+        // Only demo accounts available - must use demo
+        accountIds = demoAccounts;
+        G.Env = CtraderEnv::Demo;
+        Utils::LogToFile("ENV_SELECTION", "Using DEMO environment - only demo accounts available");
+    }
+
+    // Log the final environment decision
+    char finalMsg[256];
+    sprintf_s(finalMsg, "Final environment: %s with %zu accounts",
+             (G.Env == CtraderEnv::Live) ? "LIVE" : "DEMO", accountIds.size());
+    Utils::LogToFile("ENV_FINAL", finalMsg);
 
     if (accountIds.empty()) {
         Utils::ShowMsg("No account IDs found in REST response");
@@ -376,4 +456,99 @@ bool FetchAccountsList(std::vector<long long>& accountIds) {
     return true;
 }
 
+// Additional functions from grok2.txt integration
+
+bool AppAuth(const std::string& clientId, const std::string& clientSecret, CtraderEnv env) {
+    if (clientId.empty() || clientSecret.empty()) {
+        Utils::ShowMsg("ERROR: AppAuth - Missing client credentials");
+        return false;
+    }
+
+    Utils::LogToFile("APPAUTH", "Starting OAuth2 application authentication");
+
+    // Use REST API for OAuth2 token
+    std::map<std::string, std::string> params;
+    params["grant_type"] = "client_credentials";
+    params["client_id"] = clientId;
+    params["client_secret"] = clientSecret;
+
+    std::wstring host = (env == CtraderEnv::Live) ? L"openapi.ctrader.com" : L"demo-openapi.ctrader.com";
+    std::string responseBody;
+
+    if (!WinHttpGetToken(host, L"/apps/token", params, responseBody)) {
+        Utils::ShowMsg("ERROR: AppAuth - HTTP request failed");
+        return false;
+    }
+
+    if (BodyIndicatesError(responseBody)) {
+        std::string errorDesc = Utils::GetErrorDescription(responseBody.c_str());
+        Utils::ShowMsg("ERROR: AppAuth - OAuth failed", errorDesc.c_str());
+        Utils::LogToFile("APPAUTH_ERROR", responseBody.c_str());
+        return false;
+    }
+
+    std::string accessToken, refreshToken;
+    if (!ParseJsonTokenFields(responseBody, accessToken, refreshToken)) {
+        Utils::ShowMsg("ERROR: AppAuth - Failed to parse tokens");
+        Utils::LogToFile("APPAUTH_PARSE_ERROR", responseBody.c_str());
+        return false;
+    }
+
+    if (accessToken.empty()) {
+        Utils::ShowMsg("ERROR: AppAuth - Empty access token");
+        return false;
+    }
+
+    // Store tokens
+    strncpy_s(G.Token, sizeof(G.Token), accessToken.c_str(), _TRUNCATE);
+    if (!refreshToken.empty()) {
+        strncpy_s(G.RefreshToken, sizeof(G.RefreshToken), refreshToken.c_str(), _TRUNCATE);
+    }
+
+    // Save to disk
+    if (!SaveTokenToDisk(accessToken, refreshToken)) {
+        Utils::LogToFile("APPAUTH_WARNING", "Failed to save tokens to disk");
+    }
+
+    Utils::LogToFile("APPAUTH", "OAuth2 application authentication successful");
+    return true;
 }
+
+bool AccountAuth(long long accountId) {
+    if (accountId <= 0) {
+        Utils::ShowMsg("ERROR: AccountAuth - Invalid account ID");
+        return false;
+    }
+
+    if (!G.Token[0]) {
+        Utils::ShowMsg("ERROR: AccountAuth - No access token available");
+        return false;
+    }
+
+    Utils::LogToFile("ACCOUNTAUTH", ("Starting account authentication for ID: " + std::to_string(accountId)).c_str());
+
+    // This will be handled by WebSocket in main.cpp
+    // Here we just validate the prerequisites
+    return true;
+}
+
+bool SaveTokenToDisk() {
+    return SaveTokenToDisk(G.Token, G.RefreshToken);
+}
+
+bool IsAuthenticated() {
+    return G.Token[0] != '\0' && G.HasLogin;
+}
+
+void ClearAuth() {
+    ZeroMemory(G.Token, sizeof(G.Token));
+    ZeroMemory(G.RefreshToken, sizeof(G.RefreshToken));
+    ZeroMemory(G.ClientId, sizeof(G.ClientId));
+    ZeroMemory(G.ClientSecret, sizeof(G.ClientSecret));
+    G.HasLogin = false;
+    G.CTraderAccountId = 0;
+    Utils::LogToFile("AUTH", "Authentication data cleared");
+}
+
+} // namespace Auth
+
