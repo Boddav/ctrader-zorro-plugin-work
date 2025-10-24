@@ -999,6 +999,8 @@ void HandleExecutionEvent(const char* buffer) {
     trade.amendPending = false;
     trade.pendingCloseVolume = 0;
     trade.status = executionType.empty() ? "ORDER_FILLED" : executionType;
+    trade.unrealizedPnL = 0.0;
+    trade.grossUnrealizedPnL = 0.0;
 
     G.openTrades[zorroId] = trade;
 
@@ -1341,6 +1343,8 @@ void HandlePositionListResponse(const char* buffer) {
             trade.amendPending = false;
             trade.pendingCloseVolume = 0;
             trade.status = "POSITION_SYNC";
+            trade.unrealizedPnL = 0.0;
+            trade.grossUnrealizedPnL = 0.0;
 
             auto existing = G.openTrades.find(zorroId);
             if (existing != G.openTrades.end()) {

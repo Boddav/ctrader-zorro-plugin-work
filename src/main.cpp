@@ -602,6 +602,11 @@ unsigned __stdcall NetworkThread(void*) {
             History::HandleTickDataResponse(buffer);
             break;
         }
+        case 2188: {  // ProtoOAGetPositionUnrealizedPnLRes
+            Utils::LogToFile("PNL_RESPONSE", "Received ProtoOAGetPositionUnrealizedPnLRes (2188)");
+            Account::HandlePositionPnLResponse(buffer);
+            break;
+        }
         case ToInt(PayloadType::TraderRes): {
             Utils::LogToFile("ACCOUNT_RESPONSE", buffer);
 
@@ -938,6 +943,10 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
     G.userInitiatedLogout = false;
     G.stopGuardActive = false;
     G.stopGuardSetMs = 0;
+
+    // Initialize unrealized P&L tracking
+    G.lastPnLRequestMs = 0;
+    G.pnlRequestPending = false;
 
     // NOTE: Do NOT call Symbols::Cleanup() and Symbols::Initialize() here!
     // This would clear all symbol prices and subscription states, causing
@@ -1846,6 +1855,26 @@ DLLFUNC int BrokerTime(DATE* pTime) {
             } else {
                 return 0; // Market closed (DISABLED)
             }
+        }
+    }
+
+    // Periodic unrealized P&L refresh (every 3 seconds, rate limit safe)
+    ULONGLONG now = GetTickCount64();
+    constexpr ULONGLONG PNL_REFRESH_INTERVAL_MS = 3000; // 3 seconds
+    if (G.CTraderAccountId > 0 &&
+        (now - G.lastPnLRequestMs) > PNL_REFRESH_INTERVAL_MS &&
+        !G.pnlRequestPending) {
+
+        EnterCriticalSection(&G.cs_trades);
+        int openPositions = 0;
+        for (const auto& pair : G.openTrades) {
+            if (!pair.second.closed) openPositions++;
+        }
+        LeaveCriticalSection(&G.cs_trades);
+
+        // Only request if we have open positions
+        if (openPositions > 0) {
+            Account::RequestPositionPnL(G.CTraderAccountId);
         }
     }
 

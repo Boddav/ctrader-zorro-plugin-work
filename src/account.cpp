@@ -409,5 +409,132 @@ double GetFreeMargin() {
     return g_accountInfo.freeMargin;
 }
 
+bool RequestPositionPnL(long long ctidTraderAccountId) {
+    if (ctidTraderAccountId == 0) {
+        Utils::LogToFile("PNL_REQUEST_ERROR", "Invalid account ID");
+        return false;
+    }
+
+    // Check if request already pending
+    if (G.pnlRequestPending) {
+        Utils::LogToFile("PNL_REQUEST_SKIP", "Request already pending, skipping");
+        return false;
+    }
+
+    std::string clientMsgId = Utils::GetMsgId();
+
+    // ProtoOAGetPositionUnrealizedPnLReq (PayloadType 2187)
+    char request[512];
+    sprintf_s(request, sizeof(request),
+        "{\"clientMsgId\":\"%s\",\"payloadType\":2187,\"payload\":{\"ctidTraderAccountId\":%lld}}",
+        clientMsgId.c_str(), ctidTraderAccountId);
+
+    bool sent = Network::Send(request);
+    if (sent) {
+        G.pnlRequestPending = true;
+        G.lastPnLRequestMs = GetTickCount64();
+        Utils::LogToFile("PNL_REQUEST_SENT", request);
+    } else {
+        Utils::LogToFile("PNL_REQUEST_FAILED", "Failed to send request");
+    }
+
+    return sent;
+}
+
+void HandlePositionPnLResponse(const char* buffer) {
+    if (!buffer) return;
+
+    G.pnlRequestPending = false;
+
+    Utils::LogToFile("PNL_RESPONSE_RECEIVED", buffer);
+
+    // Check for error
+    if (Utils::BodyIndicatesError(buffer)) {
+        const char* pDesc = strstr(buffer, "\"description\":\"");
+        if (pDesc) {
+            char errorMsg[256] = {0};
+            sscanf_s(pDesc, "\"description\":\"%255[^\"]\"", errorMsg, (unsigned)sizeof(errorMsg));
+            char logMsg[512];
+            sprintf_s(logMsg, "P&L request error: %s", errorMsg);
+            Utils::LogToFile("PNL_RESPONSE_ERROR", logMsg);
+        }
+        return;
+    }
+
+    // Parse position array: "position":[{...},{...}]
+    const char* positionArray = strstr(buffer, "\"position\":[");
+    if (!positionArray) {
+        Utils::LogToFile("PNL_RESPONSE_PARSE", "No position array found");
+        return;
+    }
+
+    EnterCriticalSection(&G.cs_trades);
+
+    // Parse each position in the array
+    const char* cursor = positionArray + strlen("\"position\":[");
+    int positionsUpdated = 0;
+
+    while (cursor && *cursor && *cursor != ']') {
+        // Find position object start
+        const char* objStart = strchr(cursor, '{');
+        if (!objStart) break;
+
+        // Find matching closing brace
+        const char* objEnd = strchr(objStart, '}');
+        if (!objEnd) break;
+
+        // Extract positionId
+        long long positionId = 0;
+        const char* pPosId = strstr(objStart, "\"positionId\":");
+        if (pPosId && pPosId < objEnd) {
+            sscanf_s(pPosId, "\"positionId\":%lld", &positionId);
+        }
+
+        if (positionId > 0) {
+            // Find corresponding Trade in our map
+            auto it = G.ctidToZorroId.find(positionId);
+            if (it != G.ctidToZorroId.end()) {
+                int zorroId = it->second;
+                auto tradeIt = G.openTrades.find(zorroId);
+                if (tradeIt != G.openTrades.end() && !tradeIt->second.closed) {
+                    Trade& trade = tradeIt->second;
+
+                    // Extract netUnrealizedPnL
+                    const char* pNetPnL = strstr(objStart, "\"netUnrealizedPnL\":");
+                    if (pNetPnL && pNetPnL < objEnd) {
+                        double netPnL = 0.0;
+                        sscanf_s(pNetPnL, "\"netUnrealizedPnL\":%lf", &netPnL);
+                        trade.unrealizedPnL = netPnL;
+                    }
+
+                    // Extract grossUnrealizedPnL (optional)
+                    const char* pGrossPnL = strstr(objStart, "\"grossUnrealizedPnL\":");
+                    if (pGrossPnL && pGrossPnL < objEnd) {
+                        double grossPnL = 0.0;
+                        sscanf_s(pGrossPnL, "\"grossUnrealizedPnL\":%lf", &grossPnL);
+                        trade.grossUnrealizedPnL = grossPnL;
+                    }
+
+                    positionsUpdated++;
+
+                    char logMsg[256];
+                    sprintf_s(logMsg, "Updated trade %d (posId=%lld) unrealizedPnL=%.2f grossPnL=%.2f",
+                              zorroId, positionId, trade.unrealizedPnL, trade.grossUnrealizedPnL);
+                    Utils::LogToFile("PNL_UPDATED", logMsg);
+                }
+            }
+        }
+
+        // Move to next position
+        cursor = objEnd + 1;
+    }
+
+    LeaveCriticalSection(&G.cs_trades);
+
+    char summaryMsg[128];
+    sprintf_s(summaryMsg, "Updated unrealized P&L for %d positions", positionsUpdated);
+    Utils::LogToFile("PNL_RESPONSE_DONE", summaryMsg);
+}
+
 } // namespace Account
 

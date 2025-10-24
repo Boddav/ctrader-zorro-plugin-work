@@ -43,6 +43,9 @@ struct Trade {
     double commission;
     double swap;
     bool closed;
+    double unrealizedPnL;        // Server-side calculated unrealized P&L (from API 2188)
+    double grossUnrealizedPnL;   // Gross unrealized P&L (without commission)
+    bool closePending;           // Flag to prevent duplicate close requests
 };
 
 struct CsvCreds {
@@ -92,6 +95,8 @@ struct GLOBAL {
 
     ULONGLONG lastPingMs;
     ULONGLONG lastRetryProcessMs;
+    ULONGLONG lastPnLRequestMs;      // Last time we requested position P&L
+    bool pnlRequestPending;          // Flag to prevent overlapping requests
 };
 
 extern GLOBAL G;
