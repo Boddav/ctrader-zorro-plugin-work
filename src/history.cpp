@@ -520,10 +520,12 @@ void ProcessHistoricalResponse(const char* response) {
             }
         }
 
-        // Debug: Log parsed timestamp
+        // Debug: Log parsed timestamp and raw values
         if (tickCount < 3) {  // Only log first 3 bars
-            char tsDebug[200];
-            snprintf(tsDebug, sizeof(tsDebug), "BAR[%d] timestampMinutes=%lld", tickCount, timestampMinutes);
+            char tsDebug[512];
+            snprintf(tsDebug, sizeof(tsDebug),
+                "BAR[%d] RAW: timestampMinutes=%lld, low=%lld, deltaOpen=%lld, deltaHigh=%lld, deltaClose=%lld, volume=%.6f",
+                tickCount, timestampMinutes, low, deltaOpen, deltaHigh, deltaClose, volume);
             Utils::LogToFile("HISTORY_DEBUG", tsDebug);
         }
 
@@ -542,7 +544,13 @@ void ProcessHistoricalResponse(const char* response) {
         if (deltaClosePos && deltaClosePos < barEnd) deltaClose = _atoi64(deltaClosePos + 13);
 
         const char* volPos = strstr(barStart, "\"volume\":");
-        if (volPos && volPos < barEnd) volume = atof(volPos + 9);
+        if (volPos && volPos < barEnd) {
+            volume = atof(volPos + 9);
+        } else {
+            // Fallback to tickVolume if volume not found (like REST API does)
+            const char* tickVolPos = strstr(barStart, "\"tickVolume\":");
+            if (tickVolPos && tickVolPos < barEnd) volume = atof(tickVolPos + 13);
+        }
 
         // Convert minutes to milliseconds, then to Zorro DATE
         long long timestampMs = timestampMinutes * 60000LL;
@@ -567,6 +575,23 @@ void ProcessHistoricalResponse(const char* response) {
         tick->fLow = (double)low / 100000.0;
         tick->fClose = (double)(low + deltaClose) / 100000.0;
         tick->fVal = volume;
+
+        // Debug: Log converted T6 values for first 3 bars
+        if (tickCount < 3) {
+            char t6Debug[512];
+            snprintf(t6Debug, sizeof(t6Debug),
+                "BAR[%d] T6: time=%.8f, fOpen=%.6f, fHigh=%.6f, fLow=%.6f, fClose=%.6f, fVal=%.6f",
+                tickCount, tick->time, tick->fOpen, tick->fHigh, tick->fLow, tick->fClose, tick->fVal);
+            Utils::LogToFile("HISTORY_DEBUG", t6Debug);
+        }
+
+        // Sanity check: Detect if price values are suspiciously large (possible timestamp contamination)
+        if (tick->fOpen > 1000000.0 || tick->fHigh > 1000000.0 || tick->fLow > 1000000.0 || tick->fClose > 1000000.0) {
+            char warnMsg[512];
+            sprintf_s(warnMsg, "WARNING: Suspiciously large price detected! BAR[%d] O=%.2f H=%.2f L=%.2f C=%.2f (raw: low=%lld deltaO=%lld deltaH=%lld deltaC=%lld)",
+                      tickCount, tick->fOpen, tick->fHigh, tick->fLow, tick->fClose, low, deltaOpen, deltaHigh, deltaClose);
+            Utils::LogToFile("HISTORY_SANITY_CHECK_FAIL", warnMsg);
+        }
 
         tickCount++;
         current = barEnd + 1;
