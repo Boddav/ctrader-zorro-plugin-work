@@ -97,6 +97,37 @@ struct GLOBAL {
     ULONGLONG lastRetryProcessMs;
     ULONGLONG lastPnLRequestMs;      // Last time we requested position P&L
     bool pnlRequestPending;          // Flag to prevent overlapping requests
+
+    // Request tracking flags
+    bool snapshotsRequested;         // Order/position snapshots requested
+    bool cashFlowRequested;          // Cash flow history requested
+    bool cashFlowHydrated;           // Cash flow data loaded
+    bool assetMetadataRequested;     // Asset class/category metadata requested
+    bool symbolDetailsRequested;     // Symbol volume details requested (CRITICAL for minVolume/maxVolume!)
+
+    // Session state flags
+    bool tokenRefreshInProgress;     // OAuth token refresh in progress
+    bool userInitiatedLogout;        // User triggered logout
+    bool stopGuardActive;            // Stop guard active
+    bool loginCompleted;             // Login sequence completed
+    bool assetClassReceived;         // Asset class list received
+    bool symbolCategoryReceived;     // Symbol category list received
+    bool envLocked;                  // Environment locked (demo/live)
+
+    // Timing and state
+    ULONGLONG stopGuardSetMs;        // When stop guard was set
+    ULONGLONG lastTokenRefreshMs;    // Last token refresh time
+    ULONGLONG lastMarginUpdateMs;    // Last margin update time
+    ULONGLONG lastSessionEventMs;    // Last session event time
+    ULONGLONG subscriptionStartMs;   // Subscription start time
+    ULONGLONG lastServerTimestamp;   // Last server timestamp
+
+    // Counters and state
+    long reconnecting;               // Reconnection in progress (interlocked)
+    int quoteCount;                  // Quote counter
+    int subFallbackAttempts;         // Subscription fallback attempts
+    int orderType;                   // Current order type
+    std::string currentSymbol;       // Current symbol
 };
 
 extern GLOBAL G;

@@ -939,6 +939,7 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
     G.assetMetadataRequested = false;
     G.assetClassReceived = false;
     G.symbolCategoryReceived = false;
+    G.symbolDetailsRequested = false;  // CRITICAL: Request symbol volume details for minVolume/maxVolume
     G.lastSessionEventMs = 0;
     G.userInitiatedLogout = false;
     G.stopGuardActive = false;
