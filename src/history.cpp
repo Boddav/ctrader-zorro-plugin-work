@@ -272,13 +272,13 @@ bool RequestHistoricalData(const char* symbol, DATE startTime, DATE endTime, int
                 Utils::ShowMsg("Partial history data", warnMsg);
             }
         }
-        return receivedTicks > 0;
+        return receivedTicks;  // Return actual tick count, not boolean!
     }
 
     char timeoutMsg[128];
     sprintf_s(timeoutMsg, "WebSocket history request timed out after %d ms", timeoutMs);
     Utils::LogToFile("HISTORY_TIMEOUT", timeoutMsg);
-    return false;
+    return 0;  // Return 0 on timeout, not false
 }
 
 int ConvertTimeframeToEnum(int minutes) {
