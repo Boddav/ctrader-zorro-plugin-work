@@ -2180,6 +2180,7 @@ DLLFUNC int BrokerHistory(char* Symbol, DATE tStart, DATE tEnd,
     sprintf_s(msg, "BrokerHistory request: %s, %d minutes, %d ticks | tStart=%.8f tEnd=%.8f",
               Symbol, nTickMinutes, nTicks, tStart, tEnd);
     Utils::LogToFile("HISTORY_REQUEST", msg);
+
     // USE WEBSOCKET (REST API does not exist for cTrader history)
     Utils::LogToFile("HISTORY_DEBUG", "Using WebSocket for history");
     int actualTicks = 0;
@@ -2200,12 +2201,34 @@ DLLFUNC int BrokerHistory(char* Symbol, DATE tStart, DATE tEnd,
         sprintf_s(successMsg, "Historical data retrieved: %d ticks (requested: %d)", actualTicks, nTicks);
         Utils::LogToFile("HISTORY", successMsg);
 
-        // Log first tick for debugging
+        // Check if we got significantly less than requested
+        if (nTicks > 0 && actualTicks < nTicks) {
+            double percentage = (double)actualTicks / (double)nTicks * 100.0;
+            if (percentage < 90.0) {  // Less than 90% received
+                char warnMsg[256];
+                sprintf_s(warnMsg, "BrokerHistory WARNING: Received only %d/%d bars (%.0f%%) for %s @ %dmin timeframe",
+                          actualTicks, nTicks, percentage, Symbol, nTickMinutes);
+                Utils::LogToFile("HISTORY_SHORTAGE", warnMsg);
+
+                if (percentage < 70.0) {  // Less than 70% - critical shortage
+                    Utils::ShowMsg("History Data Shortage", warnMsg);
+                }
+            }
+        }
+
+        // Log first and last tick for debugging
         if (actualTicks > 0 && ticks) {
-            char tickMsg[256];
+            char tickMsg[512];
             sprintf_s(tickMsg, "HISTORY_FIRST_TICK: time=%.8f open=%.5f high=%.5f low=%.5f close=%.5f vol=%.2f",
                       ticks[0].time, ticks[0].fOpen, ticks[0].fHigh, ticks[0].fLow, ticks[0].fClose, ticks[0].fVal);
             Utils::LogToFile("HISTORY_DEBUG", tickMsg);
+
+            if (actualTicks > 1) {
+                sprintf_s(tickMsg, "HISTORY_LAST_TICK: time=%.8f open=%.5f high=%.5f low=%.5f close=%.5f vol=%.2f",
+                          ticks[actualTicks-1].time, ticks[actualTicks-1].fOpen, ticks[actualTicks-1].fHigh,
+                          ticks[actualTicks-1].fLow, ticks[actualTicks-1].fClose, ticks[actualTicks-1].fVal);
+                Utils::LogToFile("HISTORY_DEBUG", tickMsg);
+            }
         }
 
         return actualTicks;  // Return actual count received (e.g., 299 instead of 300)

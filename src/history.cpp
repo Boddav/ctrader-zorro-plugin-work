@@ -102,15 +102,25 @@ bool RequestHistoricalData(const char* symbol, DATE startTime, DATE endTime, int
     // Lookback handling: if Zorro requests last N bars (tStart == 0) use timeframe * N to compute window
     if (startTime <= 0.0 && timeframeMins > 0 && maxTicks > 0) {
         long long lookbackMs = (long long)timeframeMins * 60000LL * (long long)maxTicks;
-        // Add a small margin to ensure we receive at least N bars even with session gaps
-        long long marginMs = std::min(lookbackMs / 10, 6LL * 60LL * 60LL * 1000LL); // up to 6 hours
+
+        // Enhanced margin calculation based on timeframe and market characteristics
+        // For intraday (< 1 day): add 50% margin for session gaps
+        // For daily+: add 100% margin for weekends/holidays
+        double marginFactor = (timeframeMins < 1440) ? 1.5 : 2.0;
+        long long enhancedMargin = (long long)(lookbackMs * (marginFactor - 1.0));
+
+        // Cap minimum margin at 24 hours and maximum at 7 days
+        long long minMarginMs = 24LL * 60LL * 60LL * 1000LL;  // 24 hours
+        long long maxMarginMs = 7LL * 24LL * 60LL * 60LL * 1000LL;  // 7 days
+        long long marginMs = std::max(minMarginMs, std::min(enhancedMargin, maxMarginMs));
+
         long long computedStart = endMs - (lookbackMs + marginMs);
         if (computedStart < 0) computedStart = 0;
         startMs = computedStart;
 
         char lbMsg[256];
-        sprintf_s(lbMsg, "LOOKBACK: timeframe=%d min, ticks=%d -> window=%lld ms (startMs=%lld, endMs=%lld)",
-                  timeframeMins, maxTicks, lookbackMs + marginMs, startMs, endMs);
+        sprintf_s(lbMsg, "LOOKBACK: timeframe=%d min, ticks=%d -> window=%lld ms (margin=%.0f%%, %lld ms) | startMs=%lld, endMs=%lld",
+                  timeframeMins, maxTicks, lookbackMs + marginMs, (marginFactor - 1.0) * 100, marginMs, startMs, endMs);
         Utils::LogToFile("HISTORY_LOOKBACK", lbMsg);
     }
     // DEBUG: Timestamp logging
@@ -244,12 +254,30 @@ bool RequestHistoricalData(const char* symbol, DATE startTime, DATE endTime, int
               symbol, timeframeMins, maxTicks, clientMsgId.c_str());
     Utils::LogToFile("HISTORY_REQUEST", msg);
 
+    // Adaptive timeout based on requested data size
+    // Base: 5s, +1s per 100 ticks requested, max 30s
+    int timeoutMs = 5000 + ((maxTicks / 100) * 1000);
+    timeoutMs = std::min(timeoutMs, 30000);
+
     int receivedTicks = 0;
-    if (WaitForHistoryData(clientMsgId, 5000, &receivedTicks)) {
+    if (WaitForHistoryData(clientMsgId, timeoutMs, &receivedTicks)) {
+        // Check if we received significantly less than requested
+        if (receivedTicks > 0 && maxTicks > 0 && receivedTicks < maxTicks) {
+            double percentage = (double)receivedTicks / (double)maxTicks * 100.0;
+            if (percentage < 80.0) {  // Less than 80% of requested data
+                char warnMsg[256];
+                sprintf_s(warnMsg, "WARNING: Received only %d/%d bars (%.0f%%) - may indicate insufficient lookback period or market gaps",
+                          receivedTicks, maxTicks, percentage);
+                Utils::LogToFile("HISTORY_PARTIAL_DATA", warnMsg);
+                Utils::ShowMsg("Partial history data", warnMsg);
+            }
+        }
         return receivedTicks > 0;
     }
 
-    Utils::LogToFile("HISTORY_TIMEOUT", "WebSocket history request timed out");
+    char timeoutMsg[128];
+    sprintf_s(timeoutMsg, "WebSocket history request timed out after %d ms", timeoutMs);
+    Utils::LogToFile("HISTORY_TIMEOUT", timeoutMsg);
     return false;
 }
 
