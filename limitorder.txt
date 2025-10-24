@@ -1,0 +1,78 @@
+from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
+import ctrader_open_api.messages.OpenApiMessages_pb2 as OA
+import ctrader_open_api.messages.OpenApiModelMessages_pb2 as OAModel
+import ctrader_open_api.messages.OpenApiCommonMessages_pb2 as OACommon
+import ctrader_open_api.messages.OpenApiCommonModelMessages_pb2 as OAModelCommon
+from twisted.internet import reactor
+import json
+
+credentials = json.load(open('credentials.json'))
+client = Client(EndPoints.PROTOBUF_DEMO_HOST, EndPoints.PROTOBUF_PORT, TcpProtocol)
+PROTO_OA_ERROR_RES_PAYLOAD_TYPE = OA.ProtoOAErrorRes().payloadType
+
+def main():
+  req = OA.ProtoOANewOrderReq()
+  req.ctidTraderAccountId = credentials['accountId']
+  req.orderType = OAModel.ProtoOAOrderType.LIMIT
+  req.tradeSide = OAModel.ProtoOATradeSide.BUY
+  req.symbolId = 41 # XAUUSD
+  req.limitPrice = 2700.34
+  req.volume = 100 # equals 0.01 lot
+  req.stopLoss = 2600.34
+  req.takeProfit = 2750.34
+  deferred = client.send(req)
+  deferred.addCallbacks(onNewOrderRes, onError)
+
+def onNewOrderRes(message):
+  if message.payloadType != OA.ProtoOAExecutionEvent().payloadType:
+    print('order not placed')
+    return
+  response = Protobuf.extract(message)
+  print('order successfully placed');
+  print('order id:', response.order.orderId)
+
+def onAccAuth(message):
+  if message.payloadType == PROTO_OA_ERROR_RES_PAYLOAD_TYPE:
+    print('account authentication failed', '\n')
+    print(Protobuf.extract(message), '\n')
+    return
+  print('account authenticated')
+  main()
+
+def onAppAuth(message):
+  if message.payloadType == PROTO_OA_ERROR_RES_PAYLOAD_TYPE:
+    print('app authentication failed', '\n')
+    print(Protobuf.extract(message), '\n')
+    return
+  print('app authenticated')
+  req = OA.ProtoOAAccountAuthReq()
+  req.ctidTraderAccountId = credentials['accountId']
+  req.accessToken = credentials['accessToken']
+  deferred = client.send(req)
+  deferred.addCallbacks(onAccAuth, onError)
+
+def onError(failure):
+  print('err: ', repr(failure.value))
+
+def connected(client):
+  print('connected')
+  req = OA.ProtoOAApplicationAuthReq()
+  req.clientId = credentials['clientId']
+  req.clientSecret = credentials['clientSecret']
+  deferred = client.send(req, responseTimeoutInSeconds=20) # err if no response under 20 secs
+  deferred.addCallbacks(onAppAuth, onError)
+
+def disconnected(client, reason):
+  print('disconnected: ', reason)
+
+def onMsg(client, message):
+  ignores = [i.payloadType for i in [OACommon.ProtoHeartbeatEvent(), OA.ProtoOAAccountAuthRes(), OA.ProtoOAApplicationAuthRes()]]
+  if message.payloadType in ignores:
+    return
+  print('message received')
+
+client.setConnectedCallback(connected)
+client.setDisconnectedCallback(disconnected)
+client.setMessageReceivedCallback(onMsg)
+client.startService()
+reactor.run()
