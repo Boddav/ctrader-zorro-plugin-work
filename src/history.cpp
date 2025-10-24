@@ -600,11 +600,33 @@ void ProcessHistoricalResponse(const char* response) {
         if (*current == ',') current++;
     }
 
+    // CRITICAL FIX: If we received MORE than requested (due to lookback margin),
+    // only keep the LAST maxTicks bars (most recent data).
+    // Otherwise Zorro will use the FIRST maxTicks bars (oldest data) - WRONG!
+    if (req->maxTicks > 0 && tickCount > req->maxTicks) {
+        int excess = tickCount - req->maxTicks;
+        char trimMsg[256];
+        sprintf_s(trimMsg, "LOOKBACK_TRIM: Received %d bars but Zorro requested only %d - trimming %d oldest bars",
+                  tickCount, req->maxTicks, excess);
+        Utils::LogToFile("HISTORY_TRIM", trimMsg);
+
+        // Move the LAST maxTicks bars to the beginning of the buffer
+        // memmove is safe for overlapping memory regions
+        memmove(req->ticksBuffer, req->ticksBuffer + excess, req->maxTicks * sizeof(T6));
+        tickCount = req->maxTicks;
+
+        char trimmedMsg[256];
+        sprintf_s(trimmedMsg, "LOOKBACK_TRIM: After trim - First bar time=%.8f, Last bar time=%.8f",
+                  req->ticksBuffer[0].time, req->ticksBuffer[tickCount-1].time);
+        Utils::LogToFile("HISTORY_TRIM", trimmedMsg);
+    }
+
     req->receivedTicks = tickCount;
     req->completed = true;
 
     char msg[256];
-    sprintf_s(msg, "Parsed %d historical bars for msgId: %s", tickCount, clientMsgId.c_str());
+    sprintf_s(msg, "Parsed %d historical bars for msgId: %s (maxTicks=%d)",
+              tickCount, clientMsgId.c_str(), req->maxTicks);
     Utils::LogToFile("HISTORY_PARSED", msg);
 
     LeaveCriticalSection(&g_cs_history);
