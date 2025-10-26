@@ -102,15 +102,25 @@ bool RequestHistoricalData(const char* symbol, DATE startTime, DATE endTime, int
     // Lookback handling: if Zorro requests last N bars (tStart == 0) use timeframe * N to compute window
     if (startTime <= 0.0 && timeframeMins > 0 && maxTicks > 0) {
         long long lookbackMs = (long long)timeframeMins * 60000LL * (long long)maxTicks;
-        // Add a small margin to ensure we receive at least N bars even with session gaps
-        long long marginMs = std::min(lookbackMs / 10, 6LL * 60LL * 60LL * 1000LL); // up to 6 hours
+
+        // Enhanced margin calculation based on timeframe and market characteristics
+        // For intraday (< 1 day): add 50% margin for session gaps
+        // For daily+: add 100% margin for weekends/holidays
+        double marginFactor = (timeframeMins < 1440) ? 1.5 : 2.0;
+        long long enhancedMargin = (long long)(lookbackMs * (marginFactor - 1.0));
+
+        // Cap minimum margin at 24 hours and maximum at 7 days
+        long long minMarginMs = 24LL * 60LL * 60LL * 1000LL;  // 24 hours
+        long long maxMarginMs = 7LL * 24LL * 60LL * 60LL * 1000LL;  // 7 days
+        long long marginMs = std::max(minMarginMs, std::min(enhancedMargin, maxMarginMs));
+
         long long computedStart = endMs - (lookbackMs + marginMs);
         if (computedStart < 0) computedStart = 0;
         startMs = computedStart;
 
         char lbMsg[256];
-        sprintf_s(lbMsg, "LOOKBACK: timeframe=%d min, ticks=%d -> window=%lld ms (startMs=%lld, endMs=%lld)",
-                  timeframeMins, maxTicks, lookbackMs + marginMs, startMs, endMs);
+        sprintf_s(lbMsg, "LOOKBACK: timeframe=%d min, ticks=%d -> window=%lld ms (margin=%.0f%%, %lld ms) | startMs=%lld, endMs=%lld",
+                  timeframeMins, maxTicks, lookbackMs + marginMs, (marginFactor - 1.0) * 100, marginMs, startMs, endMs);
         Utils::LogToFile("HISTORY_LOOKBACK", lbMsg);
     }
     // DEBUG: Timestamp logging
@@ -244,13 +254,31 @@ bool RequestHistoricalData(const char* symbol, DATE startTime, DATE endTime, int
               symbol, timeframeMins, maxTicks, clientMsgId.c_str());
     Utils::LogToFile("HISTORY_REQUEST", msg);
 
+    // Adaptive timeout based on requested data size
+    // Base: 5s, +1s per 100 ticks requested, max 30s
+    int timeoutMs = 5000 + ((maxTicks / 100) * 1000);
+    timeoutMs = std::min(timeoutMs, 30000);
+
     int receivedTicks = 0;
-    if (WaitForHistoryData(clientMsgId, 5000, &receivedTicks)) {
-        return receivedTicks > 0;
+    if (WaitForHistoryData(clientMsgId, timeoutMs, &receivedTicks)) {
+        // Check if we received significantly less than requested
+        if (receivedTicks > 0 && maxTicks > 0 && receivedTicks < maxTicks) {
+            double percentage = (double)receivedTicks / (double)maxTicks * 100.0;
+            if (percentage < 80.0) {  // Less than 80% of requested data
+                char warnMsg[256];
+                sprintf_s(warnMsg, "WARNING: Received only %d/%d bars (%.0f%%) - may indicate insufficient lookback period or market gaps",
+                          receivedTicks, maxTicks, percentage);
+                Utils::LogToFile("HISTORY_PARTIAL_DATA", warnMsg);
+                Utils::ShowMsg("Partial history data", warnMsg);
+            }
+        }
+        return receivedTicks;  // Return actual tick count, not boolean!
     }
 
-    Utils::LogToFile("HISTORY_TIMEOUT", "WebSocket history request timed out");
-    return false;
+    char timeoutMsg[128];
+    sprintf_s(timeoutMsg, "WebSocket history request timed out after %d ms", timeoutMs);
+    Utils::LogToFile("HISTORY_TIMEOUT", timeoutMsg);
+    return 0;  // Return 0 on timeout, not false
 }
 
 int ConvertTimeframeToEnum(int minutes) {
@@ -492,10 +520,12 @@ void ProcessHistoricalResponse(const char* response) {
             }
         }
 
-        // Debug: Log parsed timestamp
+        // Debug: Log parsed timestamp and raw values
         if (tickCount < 3) {  // Only log first 3 bars
-            char tsDebug[200];
-            snprintf(tsDebug, sizeof(tsDebug), "BAR[%d] timestampMinutes=%lld", tickCount, timestampMinutes);
+            char tsDebug[512];
+            snprintf(tsDebug, sizeof(tsDebug),
+                "BAR[%d] RAW: timestampMinutes=%lld, low=%lld, deltaOpen=%lld, deltaHigh=%lld, deltaClose=%lld, volume=%.6f",
+                tickCount, timestampMinutes, low, deltaOpen, deltaHigh, deltaClose, volume);
             Utils::LogToFile("HISTORY_DEBUG", tsDebug);
         }
 
@@ -514,7 +544,13 @@ void ProcessHistoricalResponse(const char* response) {
         if (deltaClosePos && deltaClosePos < barEnd) deltaClose = _atoi64(deltaClosePos + 13);
 
         const char* volPos = strstr(barStart, "\"volume\":");
-        if (volPos && volPos < barEnd) volume = atof(volPos + 9);
+        if (volPos && volPos < barEnd) {
+            volume = atof(volPos + 9);
+        } else {
+            // Fallback to tickVolume if volume not found (like REST API does)
+            const char* tickVolPos = strstr(barStart, "\"tickVolume\":");
+            if (tickVolPos && tickVolPos < barEnd) volume = atof(tickVolPos + 13);
+        }
 
         // Convert minutes to milliseconds, then to Zorro DATE
         long long timestampMs = timestampMinutes * 60000LL;
@@ -540,6 +576,23 @@ void ProcessHistoricalResponse(const char* response) {
         tick->fClose = (double)(low + deltaClose) / 100000.0;
         tick->fVal = volume;
 
+        // Debug: Log converted T6 values for first 3 bars
+        if (tickCount < 3) {
+            char t6Debug[512];
+            snprintf(t6Debug, sizeof(t6Debug),
+                "BAR[%d] T6: time=%.8f, fOpen=%.6f, fHigh=%.6f, fLow=%.6f, fClose=%.6f, fVal=%.6f",
+                tickCount, tick->time, tick->fOpen, tick->fHigh, tick->fLow, tick->fClose, tick->fVal);
+            Utils::LogToFile("HISTORY_DEBUG", t6Debug);
+        }
+
+        // Sanity check: Detect if price values are suspiciously large (possible timestamp contamination)
+        if (tick->fOpen > 1000000.0 || tick->fHigh > 1000000.0 || tick->fLow > 1000000.0 || tick->fClose > 1000000.0) {
+            char warnMsg[512];
+            sprintf_s(warnMsg, "WARNING: Suspiciously large price detected! BAR[%d] O=%.2f H=%.2f L=%.2f C=%.2f (raw: low=%lld deltaO=%lld deltaH=%lld deltaC=%lld)",
+                      tickCount, tick->fOpen, tick->fHigh, tick->fLow, tick->fClose, low, deltaOpen, deltaHigh, deltaClose);
+            Utils::LogToFile("HISTORY_SANITY_CHECK_FAIL", warnMsg);
+        }
+
         tickCount++;
         current = barEnd + 1;
 
@@ -547,11 +600,33 @@ void ProcessHistoricalResponse(const char* response) {
         if (*current == ',') current++;
     }
 
+    // CRITICAL FIX: If we received MORE than requested (due to lookback margin),
+    // only keep the LAST maxTicks bars (most recent data).
+    // Otherwise Zorro will use the FIRST maxTicks bars (oldest data) - WRONG!
+    if (req->maxTicks > 0 && tickCount > req->maxTicks) {
+        int excess = tickCount - req->maxTicks;
+        char trimMsg[256];
+        sprintf_s(trimMsg, "LOOKBACK_TRIM: Received %d bars but Zorro requested only %d - trimming %d oldest bars",
+                  tickCount, req->maxTicks, excess);
+        Utils::LogToFile("HISTORY_TRIM", trimMsg);
+
+        // Move the LAST maxTicks bars to the beginning of the buffer
+        // memmove is safe for overlapping memory regions
+        memmove(req->ticksBuffer, req->ticksBuffer + excess, req->maxTicks * sizeof(T6));
+        tickCount = req->maxTicks;
+
+        char trimmedMsg[256];
+        sprintf_s(trimmedMsg, "LOOKBACK_TRIM: After trim - First bar time=%.8f, Last bar time=%.8f",
+                  req->ticksBuffer[0].time, req->ticksBuffer[tickCount-1].time);
+        Utils::LogToFile("HISTORY_TRIM", trimmedMsg);
+    }
+
     req->receivedTicks = tickCount;
     req->completed = true;
 
     char msg[256];
-    sprintf_s(msg, "Parsed %d historical bars for msgId: %s", tickCount, clientMsgId.c_str());
+    sprintf_s(msg, "Parsed %d historical bars for msgId: %s (maxTicks=%d)",
+              tickCount, clientMsgId.c_str(), req->maxTicks);
     Utils::LogToFile("HISTORY_PARSED", msg);
 
     LeaveCriticalSection(&g_cs_history);

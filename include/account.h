@@ -17,4 +17,10 @@ double GetEquity();
 double GetMargin();
 double GetFreeMargin();
 
+// Request unrealized P&L for all open positions
+bool RequestPositionPnL(long long ctidTraderAccountId);
+
+// Handle unrealized P&L response (PayloadType 2188)
+void HandlePositionPnLResponse(const char* buffer);
+
 } // namespace Account
