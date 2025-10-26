@@ -468,23 +468,30 @@ void ProcessHistoricalResponse(const char* response) {
         return;
     }
 
+    // Allocate temporary buffer to hold ALL bars from server (including lookback margin)
+    // Maximum possible: 3x the requested amount (2x margin + original request)
+    // Using unique_ptr for automatic cleanup on early returns/exceptions
+    int tempBufferSize = req->maxTicks * 3;
+    std::unique_ptr<T6[]> tempBuffer(new T6[tempBufferSize]);
+    int tickCount = 0;
+
     // Move pointer past the array label
     dataStart = strchr(dataStart, '[');
     if (!dataStart) {
         req->completed = true;
         LeaveCriticalSection(&g_cs_history);
-        return;
+        return;  // tempBuffer automatically freed by unique_ptr
     }
 
     dataStart += 1;
     const char* current = dataStart;
-    int tickCount = 0;
 
     // cTrader API ALWAYS uses 100,000 scale (not 10^digits) - see downloadtickdatasample.md reference
     // Python ref: df2['open'] = (df['low'] + df['deltaOpen']) / 100_000
     // Use literal division to match Python exactly (no double constant to avoid precision loss)
 
-    while (current && *current && tickCount < req->maxTicks) {
+    // Parse ALL bars from server into temporary buffer
+    while (current && *current && tickCount < tempBufferSize) {
         const char* barStart = strchr(current, '{');
         if (!barStart) break;
 
@@ -568,7 +575,7 @@ void ProcessHistoricalResponse(const char* response) {
         // Calculate prices with INTEGER arithmetic first, then divide by 100,000
         // Matching Python reference: df2['open'] = (df['low'] + df['deltaOpen']) / 100_000
         // cTrader API sends all prices as long long integers, scaled by 100,000
-        T6* tick = &req->ticksBuffer[tickCount];
+        T6* tick = &tempBuffer[tickCount];
         tick->time = zorroTime;
         tick->fOpen = (double)(low + deltaOpen) / 100000.0;
         tick->fHigh = (double)(low + deltaHigh) / 100000.0;
@@ -600,33 +607,36 @@ void ProcessHistoricalResponse(const char* response) {
         if (*current == ',') current++;
     }
 
-    // CRITICAL FIX: If we received MORE than requested (due to lookback margin),
-    // only keep the LAST maxTicks bars (most recent data).
-    // Otherwise Zorro will use the FIRST maxTicks bars (oldest data) - WRONG!
-    if (req->maxTicks > 0 && tickCount > req->maxTicks) {
-        int excess = tickCount - req->maxTicks;
+    // Copy the LAST maxTicks bars from tempBuffer to req->ticksBuffer
+    // This ensures we get the MOST RECENT data, not the oldest
+    int barsToReturn = std::min(tickCount, req->maxTicks);
+    int startOffset = (tickCount > req->maxTicks) ? (tickCount - req->maxTicks) : 0;
+
+    if (startOffset > 0) {
         char trimMsg[256];
-        sprintf_s(trimMsg, "LOOKBACK_TRIM: Received %d bars but Zorro requested only %d - trimming %d oldest bars",
-                  tickCount, req->maxTicks, excess);
+        sprintf_s(trimMsg, "LOOKBACK_TRIM: Received %d bars, returning LAST %d bars (trimming %d oldest)",
+                  tickCount, barsToReturn, startOffset);
         Utils::LogToFile("HISTORY_TRIM", trimMsg);
+    }
 
-        // Move the LAST maxTicks bars to the beginning of the buffer
-        // memmove is safe for overlapping memory regions
-        memmove(req->ticksBuffer, req->ticksBuffer + excess, req->maxTicks * sizeof(T6));
-        tickCount = req->maxTicks;
+    // Copy bars to destination buffer (thread-safe: still under critical section)
+    memcpy(req->ticksBuffer, tempBuffer.get() + startOffset, barsToReturn * sizeof(T6));
 
+    // tempBuffer automatically freed by unique_ptr when going out of scope
+
+    if (barsToReturn > 0) {
         char trimmedMsg[256];
-        sprintf_s(trimmedMsg, "LOOKBACK_TRIM: After trim - First bar time=%.8f, Last bar time=%.8f",
-                  req->ticksBuffer[0].time, req->ticksBuffer[tickCount-1].time);
+        sprintf_s(trimmedMsg, "LOOKBACK_RESULT: First bar time=%.8f, Last bar time=%.8f",
+                  req->ticksBuffer[0].time, req->ticksBuffer[barsToReturn-1].time);
         Utils::LogToFile("HISTORY_TRIM", trimmedMsg);
     }
 
-    req->receivedTicks = tickCount;
+    req->receivedTicks = barsToReturn;
     req->completed = true;
 
     char msg[256];
-    sprintf_s(msg, "Parsed %d historical bars for msgId: %s (maxTicks=%d)",
-              tickCount, clientMsgId.c_str(), req->maxTicks);
+    sprintf_s(msg, "Parsed %d bars, returned %d bars for msgId: %s (maxTicks=%d)",
+              tickCount, barsToReturn, clientMsgId.c_str(), req->maxTicks);
     Utils::LogToFile("HISTORY_PARSED", msg);
 
     LeaveCriticalSection(&g_cs_history);
