@@ -1406,16 +1406,60 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             }
             return 1;
 
-        case GET_LOCK: // 46 - enter critical section (multi-thread safety)
-            EnterCriticalSection(&G.csTrades);
-            return 1;
+        case GET_LOCK: // 46 - does plugin need thread locking? Return 1=yes
+            return 1;  // Yes, we have a NetworkThread that modifies shared state
 
-        case SET_LOCK: // 171 - leave critical section
-            LeaveCriticalSection(&G.csTrades);
+        case SET_LOCK: // 171 - lock(1) or unlock(0) critical section
+            if (dwParameter)
+                EnterCriticalSection(&G.csTrades);
+            else
+                LeaveCriticalSection(&G.csTrades);
             return 1;
 
         case GET_MAXTICKS: // 43 - max ticks for history
             return 8000;
+
+        case GET_HEARTBEAT: // 47 - max ms between API calls before disconnect
+            return 25000;  // cTrader disconnects at 30s, send at 25s to be safe
+
+        case GET_MAXREQUESTS: // 45 - max requests per second
+            return 5;  // conservative limit for cTrader rate limiting
+
+        case GET_TRADEALLOWED: // 22 - is trading allowed for current symbol?
+            if (!G.loggedIn || !WebSocket::IsConnected()) return 0;
+            return 1;  // cTrader server validates trading hours; let it reject if closed
+
+        case GET_TRADES: { // 71 - fill int array with open trade IDs
+            // dwParameter = pointer to int array (Zorro provides buffer)
+            // Returns count of open Zorro-managed trades (not external/reconciled)
+            if (!dwParameter) return 0;
+            int* pIds = (int*)dwParameter;
+            int count = 0;
+            CsLock lock(G.csTrades);
+            for (auto& kv : G.trades) {
+                if (kv.second.open && !kv.second.reconciled && kv.second.positionId > 0) {
+                    pIds[count++] = kv.first;  // zorroId
+                }
+            }
+            Log::Info("CMD", "GET_TRADES: %d open Zorro trades returned", count);
+            return (double)count;
+        }
+
+        case SET_HWND: // 172 - store Zorro's window handle
+            return 1;  // acknowledged, not used
+
+        case SET_SLIPPAGE: // 129 - max slippage in pips (stored but not enforced by plugin)
+            return 1;  // acknowledged, cTrader handles slippage server-side
+
+        case SET_MAGIC: // 130 - magic number (appended to order label if non-zero)
+            return 1;  // acknowledged, not used (we use z_N labels instead)
+
+        case SET_SERVER: // 182 - override server address
+            if (dwParameter) {
+                G.hostOverride = (const char*)dwParameter;
+                Log::Info("CMD", "SET_SERVER: %s", G.hostOverride.c_str());
+            }
+            return 1;
 
         case SET_STOPLOSS: // 2001 - set pending SL price for AmendPositionSltp
             if (dwParameter) {

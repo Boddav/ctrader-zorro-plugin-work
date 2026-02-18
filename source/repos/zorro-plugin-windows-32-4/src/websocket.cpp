@@ -177,6 +177,22 @@ int Receive(char* buffer, int bufferSize) {
     } while (bufferType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE &&
              totalRead < bufferSize - 1);
 
+    // Fragment overflow protection: if buffer full but message not complete,
+    // drain remaining fragments to prevent corrupting subsequent messages
+    if (bufferType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE &&
+        totalRead >= bufferSize - 1) {
+        Log::Error("WS", "Message exceeds buffer (%d bytes), draining remaining fragments", totalRead);
+        char drain[4096];
+        DWORD drainRead;
+        WINHTTP_WEB_SOCKET_BUFFER_TYPE drainType;
+        do {
+            DWORD err = WinHttpWebSocketReceive(G.hWebSocket, drain, sizeof(drain),
+                                                &drainRead, &drainType);
+            if (err != NO_ERROR) break;
+        } while (drainType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE);
+        return -1;  // discard this oversized message
+    }
+
     buffer[totalRead] = '\0';
     Log::Diag(2, "RECV: %s", buffer);
     return totalRead;
