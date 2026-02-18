@@ -90,6 +90,12 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
 
     // Volume conversion: Amount is in base currency units (Zorro convention)
     long long vol = ZorroToVolume(amount);
+
+    // Round to nearest stepVolume (cTrader requires volume to be a multiple of stepVolume)
+    if (sym.stepVolume > 0) {
+        vol = ((vol + sym.stepVolume / 2) / sym.stepVolume) * sym.stepVolume;
+    }
+
     if (vol < sym.minVolume) {
         Log::Warn("TRADE", "BuyOrder: volume %lld below minimum %lld, clamping", vol, sym.minVolume);
         vol = sym.minVolume;
@@ -141,10 +147,11 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
     }
 
     // Build NewOrderReq payload
-    // Label: use SET_ORDERTEXT value if set, otherwise default "z_{zorroId}"
+    // Label: always starts with "z_{zorroId}" for position persistence after restart.
+    // SET_ORDERTEXT value is appended after the z_N prefix.
     char labelBuf[128];
     if (!G.orderLabel.empty()) {
-        sprintf_s(labelBuf, "%s", G.orderLabel.c_str());
+        sprintf_s(labelBuf, "z_%d_%s", zorroId, G.orderLabel.c_str());
     } else {
         sprintf_s(labelBuf, "z_%d", zorroId);
     }
@@ -523,6 +530,10 @@ int SellOrder(int tradeId, int amount, double limit,
     long long closeVol = ti.volume;  // default: close all
     if (amount != 0) {
         closeVol = ZorroToVolume(amount);
+        // Round to nearest stepVolume
+        if (sym.stepVolume > 0) {
+            closeVol = ((closeVol + sym.stepVolume / 2) / sym.stepVolume) * sym.stepVolume;
+        }
         if (closeVol > ti.volume) closeVol = ti.volume;
     }
 
@@ -602,13 +613,20 @@ int SellOrder(int tradeId, int amount, double limit,
                     fullyClosed = true;
                 }
 
-                // Calculate profit
+                // Calculate profit in quote currency, then convert to deposit currency
                 double lotAmount = (double)sym.lotSize / 100.0;
                 double lots = (double)filledVol / (double)sym.lotSize;
                 double priceDiff = (ti.tradeSide == 1)
                     ? (closePrice - ti.openPrice)
                     : (ti.openPrice - closePrice);
                 double profit = priceDiff * lots * lotAmount;
+
+                // Cross-currency conversion: quote -> deposit
+                if (G.depositAssetId > 0 && sym.symbolId > 0) {
+                    if (G.depositAssetId == sym.baseAssetId && closePrice > 0.0) {
+                        profit /= closePrice;
+                    }
+                }
 
                 if (pClose) *pClose = closePrice;
                 if (pCost) *pCost = ti.swap + ti.commission + commission;
@@ -721,28 +739,33 @@ int GetTradeStatus(int tradeId, double* pOpen, double* pClose,
         return -1;  // trade closed = Zorro books P&L
     }
 
-    // Get current price for unrealized PnL
+    // Get current close price
     SymbolInfo sym;
     double closePrice = 0.0;
     if (Symbols::GetSymbol(ti.symbol.c_str(), sym)) {
         closePrice = (ti.tradeSide == 1) ? sym.bid : sym.ask;
+    }
 
-        double lotAmount = (double)sym.lotSize / 100.0;
-        double lots = (double)ti.volume / (double)sym.lotSize;
+    if (pOpen) *pOpen = ti.openPrice;
+    if (pClose) *pClose = closePrice;
+
+    // Local profit calculation with deposit currency conversion
+    {
         double priceDiff = (ti.tradeSide == 1)
             ? (closePrice - ti.openPrice)
             : (ti.openPrice - closePrice);
-        double profit = priceDiff * lots * lotAmount;
+        double profit = priceDiff * (double)ti.volume / 100.0;
 
-        if (pOpen) *pOpen = ti.openPrice;
-        if (pClose) *pClose = closePrice;
-        if (pCost) *pCost = ti.swap + ti.commission;
+        // Cross-currency conversion: quote -> deposit
+        SymbolInfo sym2;
+        if (G.depositAssetId > 0 && Symbols::GetSymbol(ti.symbol.c_str(), sym2) && sym2.symbolId > 0) {
+            if (G.depositAssetId == sym2.baseAssetId && closePrice > 0.0) {
+                profit /= closePrice;
+            }
+        }
+
         if (pProfit) *pProfit = profit;
-    } else {
-        if (pOpen) *pOpen = ti.openPrice;
-        if (pClose) *pClose = 0.0;
         if (pCost) *pCost = ti.swap + ti.commission;
-        if (pProfit) *pProfit = 0.0;
     }
 
     // BrokerTrade return value = nLotAmount, ALWAYS POSITIVE (Zorro convention)
@@ -885,6 +908,11 @@ bool RequestReconcile() {
 }
 
 void HandleReconcileRes(const char* buffer) {
+    // DEBUG: log first 500 chars of reconcile response
+    char snippet[500] = {};
+    strncpy_s(snippet, sizeof(snippet), buffer, sizeof(snippet) - 1);
+    Log::Info("RECON", "ReconcileRes (first 500): %s", snippet);
+
     // Parse position array from reconcile response
     const char* arr = Protocol::ExtractArray(buffer, "position");
     if (!arr || *arr == '\0' || (*arr == '[' && *(arr + 1) == ']')) {
@@ -1238,6 +1266,65 @@ bool AmendPositionSltp(int tradeId, double stopLoss, double takeProfit) {
     G.waitingForTrading = false;
     Log::Error("TRADE", "AmendSLTP: too many events without ACCEPTED");
     return false;
+}
+
+// ============================================================
+// RefreshUnrealizedPnL - get server-side gross/net PnL for all open positions
+// Uses GetPosUnrealizedPnLReq (2187) / GetPosUnrealizedPnLRes (2188)
+// ============================================================
+
+bool RefreshUnrealizedPnL() {
+    // Not used — MQL5-style local calculation instead
+    return false;
+}
+
+// Called from NetworkThread when GetPosUnrealizedPnLRes (2188) arrives
+// CRITICAL: NO LOCKS during parsing. Only brief lock for cache swap.
+void HandleUnrealizedPnLRes(const char* buffer) {
+    // Step 1: Parse ENTIRELY without locks (no csLog, no csTrades)
+    int md = Protocol::ExtractInt(buffer, "moneyDigits");
+    double scale = (md > 0) ? pow(10.0, (double)md) : pow(10.0, (double)G.moneyDigits);
+
+    // Parse array into LOCAL temp storage (no lock needed)
+    struct TempPnL { long long posId; double gross; double net; };
+    TempPnL temp[64];  // max 64 positions
+    int tempCount = 0;
+
+    const char* arr = Protocol::ExtractArray(buffer, "positionUnrealizedPnL");
+    if (arr && *arr != '\0') {
+        int count = Protocol::CountArrayElements(arr);
+        if (count > 64) count = 64;
+
+        for (int i = 0; i < count; i++) {
+            const char* elem = Protocol::GetArrayElement(arr, i);
+            if (!elem) continue;
+
+            long long posId = Protocol::ExtractInt64(elem, "positionId");
+            long long grossRaw = Protocol::ExtractInt64(elem, "grossUnrealizedPnL");
+            long long netRaw = Protocol::ExtractInt64(elem, "netUnrealizedPnL");
+
+            temp[tempCount].posId = posId;
+            temp[tempCount].gross = (double)grossRaw / scale;
+            temp[tempCount].net = (double)netRaw / scale;
+            tempCount++;
+        }
+    }
+
+    // Step 2: Brief lock to swap cache (microseconds, no I/O inside lock)
+    {
+        CsLock lock(G.csTrades);
+        G.pnlCache.clear();
+        for (int i = 0; i < tempCount; i++) {
+            State::PnLEntry entry;
+            entry.gross = temp[i].gross;
+            entry.net = temp[i].net;
+            G.pnlCache[temp[i].posId] = entry;
+        }
+    }
+    G.pnlCacheTimeMs = GetTickCount64();
+
+    // Step 3: Log AFTER all locks released
+    Log::Diag(1, "PnL updated: %d positions (md=%d scale=%.0f)", tempCount, md, scale);
 }
 
 } // namespace Trading

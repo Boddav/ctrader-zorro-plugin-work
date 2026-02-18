@@ -54,6 +54,8 @@ void Reset() {
     G.margin = 0.0;
     G.freeMargin = 0.0;
     G.moneyDigits = 2;
+    G.depositAssetId = 0;
+    G.leverageInCents = 0;
 
     // Timing
     G.lastHeartbeatMs = 0;

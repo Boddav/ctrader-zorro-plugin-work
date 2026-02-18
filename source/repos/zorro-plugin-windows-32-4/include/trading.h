@@ -35,4 +35,11 @@ bool CancelOrder(int tradeId);
 // Amend SL/TP on an existing open position (M5)
 bool AmendPositionSltp(int tradeId, double stopLoss, double takeProfit);
 
+// Refresh unrealized PnL cache from server (GetPosUnrealizedPnLReq 2187)
+// Returns true if cache was refreshed, false on error/timeout
+bool RefreshUnrealizedPnL();
+
+// Called from NetworkThread when GetPosUnrealizedPnLRes (2188) arrives
+void HandleUnrealizedPnLRes(const char* buffer);
+
 } // namespace Trading

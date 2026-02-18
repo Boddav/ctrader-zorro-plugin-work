@@ -150,6 +150,7 @@ struct State {
     double freeMargin = 0.0;
     int moneyDigits = 2;
     long long leverageInCents = 0;  // from TraderRes: 50000 = 500:1
+    long long depositAssetId = 0;   // from TraderRes: account deposit currency asset ID
 
     // Diagnostics
     int diagLevel = 0;
@@ -181,6 +182,11 @@ struct State {
     // AmendPositionSltp state (M5)
     double pendingSL = 0.0;
     double pendingTP = 0.0;
+
+    // Unrealized PnL cache (from GetPosUnrealizedPnLReq/Res)
+    struct PnLEntry { double gross = 0.0; double net = 0.0; };
+    std::map<long long, PnLEntry> pnlCache;  // positionId -> {gross, net}
+    ULONGLONG pnlCacheTimeMs = 0;            // last refresh timestamp
 
     // Subscription tracking
     int quoteCount = 0;

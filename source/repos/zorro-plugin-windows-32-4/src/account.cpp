@@ -62,6 +62,13 @@ void HandleTraderRes(const char* buffer) {
         G.leverageInCents = lev;
     }
 
+    // Deposit currency asset ID (for cross-currency profit conversion)
+    long long depAsset = Protocol::ExtractInt64(trader, "depositAssetId");
+    if (depAsset > 0) {
+        G.depositAssetId = depAsset;
+        Log::Info("ACC", "depositAssetId=%lld", depAsset);
+    }
+
     // Bug #10: initialize equity from balance if not yet set
     if (G.equity <= 0.0 && G.balance > 0.0) {
         G.equity = G.balance;
@@ -86,7 +93,7 @@ void HandleMarginChangedEvent(const char* buffer) {
     if (Protocol::HasField(buffer, "balance"))
         G.balance = (double)Protocol::ExtractInt64(buffer, "balance") / scale;
 
-    Log::Diag(1, "Margin update: bal=%.2f eq=%.2f margin=%.2f free=%.2f",
+    Log::Info("ACC", "Margin: bal=%.2f eq=%.2f margin=%.2f free=%.2f",
               G.balance, G.equity, G.margin, G.freeMargin);
 }
 

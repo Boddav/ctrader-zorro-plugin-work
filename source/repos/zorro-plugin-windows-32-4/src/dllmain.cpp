@@ -199,6 +199,9 @@ static unsigned __stdcall NetworkThread(void* param) {
                 Trading::HandleReconcileRes(buffer);
                 break;
 
+            case ToInt(PayloadType::GetPositionUnrealizedPnLRes):
+                break;
+
             case ToInt(PayloadType::ErrorRes):
                 Log::Error("NET", "Error from server: %s",
                           Protocol::ExtractString(buffer, "description"));
@@ -546,6 +549,16 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
     SymbolInfo sym;
     if (!Symbols::GetSymbol(Asset, sym)) return 0;
 
+    // Wait up to 2s for both bid and ask to arrive (SpotEvents are async)
+    if (sym.bid <= 0.0 || sym.ask <= 0.0) {
+        ULONGLONG waitStart = GetTickCount64();
+        while (GetTickCount64() - waitStart < 2000) {
+            Sleep(50);
+            if (!Symbols::GetSymbol(Asset, sym)) return 0;
+            if (sym.bid > 0.0 && sym.ask > 0.0) break;
+        }
+    }
+
     if (sym.bid <= 0.0 && sym.ask <= 0.0) return 0;
 
     if (pPrice) *pPrice = sym.ask > 0.0 ? sym.ask : sym.bid;
@@ -557,17 +570,16 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
     }
 
     if (pLotAmount) {
-        // Micro-lot convention: 1 Zorro lot = 0.01 standard lots
-        // Amount=1 → 0.01 std lot, Amount=100 → 1.0 std lot
-        // lotSize/100 = cTrader volume per Zorro lot, /100 again = currency units
-        *pLotAmount = (double)sym.lotSize / 10000.0;
+        // 1 Zorro Amount unit = 100 cTrader volume units = 100 base currency units
+        // Must match ZorroToVolume: volume = abs(amount) * 100
+        *pLotAmount = 100.0;
     }
 
     if (pPipCost) {
-        // PipCost = value of 1 pip per 1 Zorro lot in quote currency
+        // PipCost = value of 1 pip per 1 Zorro lot (Amount=1) in quote currency
+        // Amount=1 → 100 base currency → 1 pip profit = pip * 100
         double pip = 1.0 / pow(10.0, (double)sym.pipPosition);
-        double lotAmount = (double)sym.lotSize / 10000.0;
-        *pPipCost = pip * lotAmount;
+        *pPipCost = pip * 100.0;
     }
 
     if (pMarginCost) {

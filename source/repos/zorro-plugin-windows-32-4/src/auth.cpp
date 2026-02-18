@@ -85,15 +85,15 @@ bool AccountAuth() {
                 return true;
             }
             if (pt == ToInt(PayloadType::ErrorRes)) {
-                Log::Error("AUTH", "Account auth failed: %s",
-                          Protocol::ExtractString(response, "description"));
+                Log::Info("AUTH", "AccountAuth rejected: %s",
+                         Protocol::ExtractString(response, "description"));
                 return false;
             }
         }
         Sleep(10);
     }
 
-    Log::Error("AUTH", "Account auth timeout");
+    Log::Info("AUTH", "AccountAuth timeout");
     return false;
 }
 
@@ -698,6 +698,16 @@ bool Login(const char* user, const char* pwd, const char* type) {
     if (strlen(G.clientId) < 5 || strlen(G.clientSecret) < 5) {
         Log::Error("AUTH", "Missing clientId or clientSecret");
         return false;
+    }
+
+    // Step 3b: Proactively refresh token to avoid "Invalid access token" errors
+    if (hasToken && strlen(G.accessToken) >= 10 && strlen(G.refreshToken) >= 10) {
+        Log::Info("AUTH", "Proactively refreshing access token...");
+        if (RefreshAccessToken()) {
+            Log::Info("AUTH", "Token refreshed proactively (new token=%.20s...)", G.accessToken);
+        } else {
+            Log::Info("AUTH", "Proactive refresh failed, will try existing token");
+        }
     }
 
     // Step 4: If no token, do OAuth browser flow
