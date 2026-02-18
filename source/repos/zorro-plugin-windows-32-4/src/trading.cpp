@@ -749,18 +749,43 @@ int GetTradeStatus(int tradeId, double* pOpen, double* pClose,
     if (pOpen) *pOpen = ti.openPrice;
     if (pClose) *pClose = closePrice;
 
-    // Local profit calculation with deposit currency conversion
+    // Profit: prefer server-calculated PnL from cache (2187/2188)
     {
-        double priceDiff = (ti.tradeSide == 1)
-            ? (closePrice - ti.openPrice)
-            : (ti.openPrice - closePrice);
-        double profit = priceDiff * (double)ti.volume / 100.0;
+        double profit = 0.0;
+        bool usedCache = false;
 
-        // Cross-currency conversion: quote -> deposit
-        SymbolInfo sym2;
-        if (G.depositAssetId > 0 && Symbols::GetSymbol(ti.symbol.c_str(), sym2) && sym2.symbolId > 0) {
-            if (G.depositAssetId == sym2.baseAssetId && closePrice > 0.0) {
-                profit /= closePrice;
+        // Refresh PnL cache if stale (>3 seconds) - sends 2187 from main thread
+        ULONGLONG now = GetTickCount64();
+        if (ti.positionId > 0 && (G.pnlCacheTimeMs == 0 || (now - G.pnlCacheTimeMs) > 3000)) {
+            RefreshUnrealizedPnL();
+        }
+
+        // Try server PnL cache
+        if (ti.positionId > 0 && G.pnlCacheTimeMs > 0) {
+            CsLock lock(G.csTrades);
+            auto it = G.pnlCache.find(ti.positionId);
+            if (it != G.pnlCache.end()) {
+                profit = it->second.gross;
+                usedCache = true;
+            }
+        }
+
+        // Fallback: local calculation with cross-currency conversion
+        if (!usedCache) {
+            double priceDiff = (ti.tradeSide == 1)
+                ? (closePrice - ti.openPrice)
+                : (ti.openPrice - closePrice);
+            profit = priceDiff * (double)ti.volume / 100.0;
+
+            // Cross-currency conversion: quote -> deposit
+            if (G.depositAssetId > 0 && sym.symbolId > 0) {
+                if (G.depositAssetId == sym.baseAssetId && closePrice > 0.0) {
+                    // Deposit = base currency (e.g. EUR account, EURUSD trade)
+                    // Profit is in quote (USD), divide by close price to get base (EUR)
+                    profit /= closePrice;
+                }
+                // If depositAssetId == quoteAssetId, profit already in deposit currency
+                // If neither matches (cross-pair), profit stays in quote currency (approximate)
             }
         }
 
@@ -1271,10 +1296,51 @@ bool AmendPositionSltp(int tradeId, double stopLoss, double takeProfit) {
 // ============================================================
 // RefreshUnrealizedPnL - get server-side gross/net PnL for all open positions
 // Uses GetPosUnrealizedPnLReq (2187) / GetPosUnrealizedPnLRes (2188)
+// Called from MAIN THREAD (GetTradeStatus), response forwarded by NetworkThread
 // ============================================================
 
 bool RefreshUnrealizedPnL() {
-    // Not used — MQL5-style local calculation instead
+    if (!G.loggedIn || !WebSocket::IsConnected()) return false;
+
+    // Check if there are any open trades worth querying
+    {
+        CsLock lock(G.csTrades);
+        bool hasOpen = false;
+        for (auto& kv : G.trades) {
+            if (kv.second.open && kv.second.positionId > 0) { hasOpen = true; break; }
+        }
+        if (!hasOpen) return false;
+    }
+
+    // Build and send 2187 request from main thread
+    char payload[128];
+    sprintf_s(payload, "\"ctidTraderAccountId\":%lld", G.accountId);
+    const char* msg = Protocol::BuildMessage(Utils::NextMsgId(),
+        PayloadType::GetPositionUnrealizedPnLReq, payload);
+
+    G.pnlResponseReady = false;
+    G.waitingForPnL = true;
+
+    if (!WebSocket::Send(msg)) {
+        G.waitingForPnL = false;
+        Log::Warn("PNL", "RefreshUnrealizedPnL send failed");
+        return false;
+    }
+
+    // Spin-wait for NetworkThread to deliver 2188 response (max 2s)
+    ULONGLONG start = GetTickCount64();
+    while (GetTickCount64() - start < 2000) {
+        if (G.pnlResponseReady) {
+            G.waitingForPnL = false;
+            Log::Diag(1, "PNL refresh OK (%llums)", GetTickCount64() - start);
+            return true;
+        }
+        Sleep(10);
+        if (BrokerProgress) BrokerProgress(1);
+    }
+
+    G.waitingForPnL = false;
+    Log::Warn("PNL", "RefreshUnrealizedPnL timeout (2s)");
     return false;
 }
 

@@ -183,10 +183,12 @@ struct State {
     double pendingSL = 0.0;
     double pendingTP = 0.0;
 
-    // Unrealized PnL cache (from GetPosUnrealizedPnLReq/Res)
+    // Unrealized PnL cache (from GetPosUnrealizedPnLReq/Res 2187/2188)
     struct PnLEntry { double gross = 0.0; double net = 0.0; };
     std::map<long long, PnLEntry> pnlCache;  // positionId -> {gross, net}
     ULONGLONG pnlCacheTimeMs = 0;            // last refresh timestamp
+    volatile bool waitingForPnL = false;      // main thread waiting for 2188 response
+    volatile bool pnlResponseReady = false;   // NetworkThread signals 2188 arrived
 
     // Subscription tracking
     int quoteCount = 0;

@@ -200,6 +200,8 @@ static unsigned __stdcall NetworkThread(void* param) {
                 break;
 
             case ToInt(PayloadType::GetPositionUnrealizedPnLRes):
+                Trading::HandleUnrealizedPnLRes(buffer);
+                if (G.waitingForPnL) G.pnlResponseReady = true;
                 break;
 
             case ToInt(PayloadType::ErrorRes):
@@ -611,7 +613,52 @@ DLLFUNC int BrokerAccount(char* Account, double* pBalance, double* pTradeVal,
     if (!G.loggedIn) return 0;
 
     if (pBalance) *pBalance = G.balance;
-    if (pTradeVal) *pTradeVal = G.equity - G.balance;  // unrealized P&L
+
+    if (pTradeVal) {
+        // Calculate total unrealized PnL from all open trades
+        // First try server PnL cache (if fresh enough, <5s)
+        double totalPnL = 0.0;
+        bool usedCache = false;
+        ULONGLONG now = GetTickCount64();
+
+        if (G.pnlCacheTimeMs > 0 && (now - G.pnlCacheTimeMs) < 5000) {
+            CsLock lock(G.csTrades);
+            for (auto& kv : G.trades) {
+                if (!kv.second.open || kv.second.positionId <= 0) continue;
+                auto pnlIt = G.pnlCache.find(kv.second.positionId);
+                if (pnlIt != G.pnlCache.end()) {
+                    totalPnL += pnlIt->second.gross;
+                    usedCache = true;
+                }
+            }
+        }
+
+        // Fallback: local calculation from current prices
+        if (!usedCache) {
+            CsLock lock(G.csTrades);
+            for (auto& kv : G.trades) {
+                if (!kv.second.open || kv.second.positionId <= 0) continue;
+                const TradeInfo& ti = kv.second;
+                SymbolInfo sym;
+                if (!Symbols::GetSymbol(ti.symbol.c_str(), sym)) continue;
+                double closePrice = (ti.tradeSide == 1) ? sym.bid : sym.ask;
+                if (closePrice <= 0.0) continue;
+                double priceDiff = (ti.tradeSide == 1)
+                    ? (closePrice - ti.openPrice)
+                    : (ti.openPrice - closePrice);
+                double profit = priceDiff * (double)ti.volume / 100.0;
+                // Cross-currency conversion
+                if (G.depositAssetId > 0 && sym.symbolId > 0) {
+                    if (G.depositAssetId == sym.baseAssetId && closePrice > 0.0)
+                        profit /= closePrice;
+                    // If depositAssetId == quoteAssetId, profit already in deposit currency
+                }
+                totalPnL += profit;
+            }
+        }
+        *pTradeVal = totalPnL;
+    }
+
     if (pMarginVal) *pMarginVal = G.margin;
 
     return 1;

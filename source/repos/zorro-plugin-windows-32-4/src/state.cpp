@@ -83,6 +83,15 @@ void Reset() {
         if (G.tradingResponseBuf) G.tradingResponseBuf[0] = '\0';
     }
 
+    // PnL cache
+    {
+        CsLock lock(G.csTrades);
+        G.pnlCache.clear();
+    }
+    G.pnlCacheTimeMs = 0;
+    G.waitingForPnL = false;
+    G.pnlResponseReady = false;
+
     // Current state
     G.currentSymbol.clear();
     G.orderType = 0;
@@ -143,6 +152,10 @@ void ResetConnection() {
         G.tradingResponseExecType = 0;
         if (G.tradingResponseBuf) G.tradingResponseBuf[0] = '\0';
     }
+
+    // PnL
+    G.waitingForPnL = false;
+    G.pnlResponseReady = false;
 
     Log::Info("STATE", "Connection state reset (trades/symbols preserved)");
 }
