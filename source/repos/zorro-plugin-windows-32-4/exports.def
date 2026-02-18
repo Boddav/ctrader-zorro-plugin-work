@@ -1,0 +1,14 @@
+LIBRARY "cTrader"
+EXPORTS
+    BrokerOpen
+    BrokerLogin
+    BrokerLogout
+    BrokerClose
+    BrokerTime
+    BrokerAsset
+    BrokerBuy2
+    BrokerSell2
+    BrokerTrade
+    BrokerAccount
+    BrokerHistory2
+    BrokerCommand

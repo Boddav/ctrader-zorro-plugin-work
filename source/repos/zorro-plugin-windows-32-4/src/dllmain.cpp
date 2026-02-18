@@ -22,10 +22,22 @@
 static unsigned __stdcall NetworkThread(void* param) {
     const int NET_BUF_SIZE = 2 * 1024 * 1024;  // 2MB for large history responses
     char* buffer = (char*)malloc(NET_BUF_SIZE);
-    if (!buffer) return 1;
+    if (!buffer) {
+        Log::Error("NET", "NetworkThread: malloc failed!");
+        return 1;
+    }
+
+    Log::Info("NET", "NetworkThread started");
+    ULONGLONG lastAliveLog = Utils::NowMs();
 
     while (G.running) {
         if (!WebSocket::IsConnected()) {
+            // Log once when we notice disconnection
+            static bool loggedDisconnect = false;
+            if (!loggedDisconnect) {
+                Log::Warn("NET", "NetworkThread: WS not connected, waiting...");
+                loggedDisconnect = true;
+            }
             Sleep(100);
             continue;
         }
@@ -35,8 +47,19 @@ static unsigned __stdcall NetworkThread(void* param) {
         if (now - G.lastHeartbeatMs > PING_INTERVAL_MS) {
             const char* hb = Protocol::BuildMessage(Utils::NextMsgId(),
                                                     PayloadType::HeartbeatEvent, "");
-            WebSocket::Send(hb);
+            bool sent = WebSocket::Send(hb);
+            if (!sent) {
+                Log::Warn("NET", "Heartbeat send FAILED! wsConnected=%d hWebSocket=%p",
+                          (int)G.wsConnected, (void*)G.hWebSocket);
+            }
             G.lastHeartbeatMs = now;
+        }
+
+        // Periodic alive log (every 60s)
+        if (now - lastAliveLog > 60000) {
+            Log::Info("NET", "NetworkThread alive: wsConn=%d quotes=%d loggedIn=%d",
+                      (int)G.wsConnected, G.quoteCount, (int)G.loggedIn);
+            lastAliveLog = now;
         }
 
         // Try to receive
@@ -139,6 +162,7 @@ static unsigned __stdcall NetworkThread(void* param) {
     }
 
     free(buffer);
+    Log::Info("NET", "NetworkThread exiting (G.running=%d)", (int)G.running);
     return 0;
 }
 
@@ -191,7 +215,50 @@ DLLFUNC int BrokerOpen(char* Name, int(__cdecl* fpMessage)(const char*),
 
     if (Name) strcpy_s(Name, 32, PLUGIN_NAME);
 
+    // Debug: write version + dllDir + log test to known path
+    {
+        char dbgPath[MAX_PATH];
+        sprintf_s(dbgPath, "%scTrader_debug.txt", G.dllDir);
+        FILE* dbg = nullptr;
+        fopen_s(&dbg, dbgPath, "w");
+        if (dbg) {
+            fprintf(dbg, "BrokerOpen v%s\ndllDir=[%s]\n", PLUGIN_VERSION, G.dllDir);
+
+            // Test: can we open cTrader.log?
+            char logPath[MAX_PATH];
+            sprintf_s(logPath, "%scTrader.log", G.dllDir);
+            FILE* logTest = nullptr;
+            errno_t logErr = fopen_s(&logTest, logPath, "a");
+            fprintf(dbg, "log fopen_s(\"%s\",\"a\") = %d (f=%p)\n", logPath, (int)logErr, (void*)logTest);
+            if (logTest) {
+                fprintf(logTest, "[DEBUG] direct write test from BrokerOpen v%s\n", PLUGIN_VERSION);
+                fclose(logTest);
+                fprintf(dbg, "log direct write OK\n");
+            }
+
+            // Test: is csLog initialized?
+            fprintf(dbg, "csLog ptr=%p\n", (void*)&G.csLog);
+            BOOL tryResult = TryEnterCriticalSection(&G.csLog);
+            fprintf(dbg, "TryEnterCriticalSection(csLog) = %d\n", tryResult);
+            if (tryResult) {
+                LeaveCriticalSection(&G.csLog);
+                fprintf(dbg, "csLog OK - enter+leave succeeded\n");
+            } else {
+                fprintf(dbg, "csLog LOCKED by another thread!\n");
+            }
+
+            fclose(dbg);
+        }
+    }
+
     Log::Info("BROKER", "BrokerOpen - %s v%s", PLUGIN_NAME, PLUGIN_VERSION);
+
+    // Show version in Zorro message window
+    if (BrokerMessage) {
+        char verMsg[128];
+        sprintf_s(verMsg, "cTrader v%s loaded", PLUGIN_VERSION);
+        BrokerMessage(verMsg);
+    }
 
     return PLUGIN_TYPE;
 }
@@ -207,9 +274,115 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
         return 0;
     }
 
-    Log::Info("BROKER", "BrokerLogin: user=%s type=%s", User, Type ? Type : "demo");
+    // === Reconnect path: if we had a previous successful login ===
+    if (G.loginCompleted) {
+        // If already connected and logged in, just confirm — don't tear down!
+        // Zorro calls BrokerLogin when transitioning from lookback to live trading.
+        if (G.loggedIn && WebSocket::IsConnected()) {
+            Log::Info("BROKER", "BrokerLogin: already connected (quotes=%d), returning 1", G.quoteCount);
+            if (Accounts) {
+                sprintf_s(Accounts, 1024, "%lld", G.accountId);
+            }
+            return 1;
+        }
 
-    // Reset state for new session
+        Log::Info("BROKER", "BrokerLogin RECONNECT: user=%s accountId=%lld (preserving trades/symbols)",
+                  User, G.accountId);
+
+        // Stop network thread before reconnecting
+        StopNetworkThread();
+        WebSocket::Disconnect();
+        G.loggedIn = false;
+
+        // Soft reset: preserve trades, symbols, account data
+        StateInit::ResetConnection();
+
+        // Fast reconnect: use stored credentials (no CSV re-parse, no Auth::Login)
+        const char* host = G.hostOverride.empty()
+            ? (G.env == Env::Live ? CTRADER_HOST_LIVE : CTRADER_HOST_DEMO)
+            : G.hostOverride.c_str();
+
+        // Reload token in case it was refreshed and saved to disk
+        Auth::LoadToken();
+
+        if (!WebSocket::Connect(host, CTRADER_WS_PORT)) {
+            Log::Error("BROKER", "Reconnect: WebSocket connect failed");
+            return 0;
+        }
+
+        if (!Auth::ApplicationAuth()) {
+            Log::Error("BROKER", "Reconnect: AppAuth failed");
+            WebSocket::Disconnect();
+            return 0;
+        }
+
+        if (!Auth::AccountAuth()) {
+            // Token may have expired — try refresh and retry
+            Log::Warn("BROKER", "Reconnect: AccountAuth failed, refreshing token...");
+            WebSocket::Disconnect();
+
+            if (!Auth::RefreshAccessToken()) {
+                Log::Error("BROKER", "Reconnect: Token refresh failed");
+                return 0;
+            }
+
+            if (!WebSocket::Connect(host, CTRADER_WS_PORT) || !Auth::ApplicationAuth()) {
+                Log::Error("BROKER", "Reconnect: Re-connect after refresh failed");
+                WebSocket::Disconnect();
+                return 0;
+            }
+
+            if (!Auth::AccountAuth()) {
+                Log::Error("BROKER", "Reconnect: AccountAuth still fails after refresh");
+                WebSocket::Disconnect();
+                return 0;
+            }
+        }
+
+        G.loggedIn = true;
+
+        // Try to reload symbol list, but continue with cached symbols if it fails
+        bool symOk = Symbols::RequestSymbolList();
+        if (symOk) {
+            Symbols::RequestSymbolDetails();
+        } else {
+            CsLock lock(G.csSymbols);
+            int existingSyms = (int)G.symbols.size();
+            if (existingSyms > 0) {
+                Log::Warn("BROKER", "Reconnect: symbol list failed but have %d cached symbols, continuing", existingSyms);
+            } else {
+                Log::Error("BROKER", "Reconnect: no symbols available");
+                WebSocket::Disconnect();
+                G.loggedIn = false;
+                return 0;
+            }
+        }
+
+        // Refresh account info
+        Account::RequestTraderInfo();
+
+        // Re-reconcile positions to sync with server
+        Trading::RequestReconcile();
+
+        // Resubscribe to spot events for previously subscribed symbols
+        Symbols::BatchResubscribe();
+
+        // Restart network thread
+        StartNetworkThread();
+
+        Log::Info("BROKER", "Reconnect complete. %d symbols, %d trades.",
+                  (int)G.symbols.size(), (int)G.trades.size());
+
+        if (Accounts) {
+            sprintf_s(Accounts, 1024, "%lld", G.accountId);
+        }
+        return 1;
+    }
+
+    // === First login path ===
+    Log::Info("BROKER", "BrokerLogin FIRST: user=%s type=%s", User, Type ? Type : "demo");
+
+    // Full reset for first login
     StateInit::Reset();
 
     // Perform login
@@ -248,14 +421,34 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
 }
 
 DLLFUNC int BrokerTime(DATE* pTimeGMT) {
-    if (!G.loggedIn) return 0;
-    if (!WebSocket::IsConnected()) return 0;
+    if (!G.loggedIn) {
+        Log::Warn("TIME", "BrokerTime=0 (loggedIn=false)");
+        return 0;
+    }
+    if (!WebSocket::IsConnected()) {
+        Log::Warn("TIME", "BrokerTime=0 (WS disconnected: wsConnected=%d hWebSocket=%p)",
+                  (int)G.wsConnected, (void*)G.hWebSocket);
+        return 0;
+    }
 
-    if (pTimeGMT && G.lastServerTimestamp > 0) {
-        *pTimeGMT = Utils::UnixToOle(G.lastServerTimestamp);
+    if (pTimeGMT) {
+        // Use system GMT time — lastServerTimestamp is unreliable because
+        // SpotEvent delta updates often omit the timestamp field
+        SYSTEMTIME st;
+        GetSystemTime(&st);
+        DATE oleDate;
+        SystemTimeToVariantTime(&st, &oleDate);
+        *pTimeGMT = oleDate;
     }
 
     if (G.quoteCount == 0) return 1;
+
+    // If no SpotEvent received for >60 seconds, market is likely closed
+    ULONGLONG now = GetTickCount64();
+    if (G.lastQuoteRecvMs > 0 && (now - G.lastQuoteRecvMs) > 60000) {
+        return 1;  // connected but no live data
+    }
+
     return 2;
 }
 
@@ -310,7 +503,7 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
 
     G.currentSymbol = Asset;
 
-    Log::Diag(1, "ASSET", "%s: lotSize=%lld pip=%d LotAmt=%.1f PipCost=%.5f MCost=%.1f",
+    Log::Diag(1, "ASSET %s: lotSize=%lld pip=%d LotAmt=%.1f PipCost=%.5f MCost=%.1f",
               Asset, sym.lotSize, sym.pipPosition,
               pLotAmount ? *pLotAmount : -1.0,
               pPipCost ? *pPipCost : -1.0,
@@ -352,9 +545,13 @@ DLLFUNC int BrokerSell2(int TradeID, int Amount, double Limit,
 DLLFUNC int BrokerTrade(int TradeID, double* pOpen, double* pClose,
                         double* pCost, double* pProfit) {
     int result = Trading::GetTradeStatus(TradeID, pOpen, pClose, pCost, pProfit);
-    if (result != 0) {
+    if (result > 0) {
         Log::Info("BROKER", "BrokerTrade: ID=%d result=%d Open=%.5f Close=%.5f Profit=%.2f",
                   TradeID, result, pOpen ? *pOpen : 0.0, pClose ? *pClose : 0.0, pProfit ? *pProfit : 0.0);
+    } else if (result == -1) {
+        Log::Info("BROKER", "BrokerTrade: ID=%d CLOSED (result=-1)", TradeID);
+    } else {
+        Log::Warn("BROKER", "BrokerTrade: ID=%d result=%d (unexpected)", TradeID, result);
     }
     return result;
 }
@@ -639,7 +836,7 @@ static int FetchRawTicks(SymbolInfo& sym, long long startMs, long long endMs,
 
             // Debug: log first 3 BID ticks
             if (tickType == 1 && i < 3) {
-                Log::Diag(1, "HIST", "Tick[%d] type=%d: ts=%lld tick=%lld -> absTs=%lld price=%.5f",
+                Log::Diag(1, "HIST Tick[%d] type=%d: ts=%lld tick=%lld -> absTs=%lld price=%.5f",
                           i, tickType, ts, tick, absTimestamp, outTicks[totalTicks].price);
             }
 
@@ -904,9 +1101,9 @@ DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
 
             // Debug: log first 3 bars and any anomalies
             if (i < 3) {
-                Log::Diag(1, "HIST", "Bar[%d] raw: low=%lld dO=%lld dH=%lld dC=%lld vol=%lld tsMin=%lld",
+                Log::Diag(1, "HIST Bar[%d] raw: low=%lld dO=%lld dH=%lld dC=%lld vol=%lld tsMin=%lld",
                           i, low, deltaOpen, deltaHigh, deltaClose, volume, tsMinutes);
-                Log::Diag(1, "HIST", "Bar[%d] T6: O=%.5f H=%.5f L=%.5f C=%.5f V=%.0f time=%.6f",
+                Log::Diag(1, "HIST Bar[%d] T6: O=%.5f H=%.5f L=%.5f C=%.5f V=%.0f time=%.6f",
                           i, bar.fOpen, bar.fHigh, bar.fLow, bar.fClose, bar.fVol, bar.time);
             }
 
@@ -997,7 +1194,7 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             // min_units = minVolume / 100 (cTrader cents → base units)
             double lotAmount = (double)sym.lotSize / 10000.0;
             double minLot = ((double)sym.minVolume / 100.0) / lotAmount;
-            Log::Diag(1, "CMD", "GET_MINLOT %s: minVol=%lld lotSize=%lld lotAmt=%.0f -> %.4f",
+            Log::Diag(1, "CMD GET_MINLOT %s: minVol=%lld lotSize=%lld lotAmt=%.0f -> %.4f",
                       G.currentSymbol.c_str(), sym.minVolume, sym.lotSize, lotAmount, minLot);
             return minLot;
         }
@@ -1026,14 +1223,45 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             return (double)G.trades.size();
         }
 
-        case GET_POSITION: { // 53 - number of open trades
-            CsLock lock(G.csTrades);
-            int count = 0;
-            for (auto& kv : G.trades) {
-                if (kv.second.open) count++;
+        case GET_POSITION: { // 53 - net open amount for given symbol (BrokerBuy2 units, signed)
+            // dwParameter = (char*) symbol name per Zorro docs (e.g. "EUR/USD")
+            const char* posSym = (dwParameter) ? (const char*)dwParameter : G.currentSymbol.c_str();
+            if (!posSym || !*posSym) return 0;
+
+            // Resolve Zorro asset name (e.g. "EUR/USD") to cTrader symbol (e.g. "EURUSD")
+            // by looking up in symbol map. Fallback: use as-is.
+            std::string resolvedSym = posSym;
+            {
+                SymbolInfo tmpSym;
+                if (Symbols::GetSymbol(posSym, tmpSym)) {
+                    resolvedSym = tmpSym.name;  // cTrader canonical name
+                }
             }
-            return (double)count;
+
+            CsLock lock(G.csTrades);
+            long long netAmount = 0;
+            double totalEntry = 0.0;
+            long long totalVol = 0;
+            for (auto& kv : G.trades) {
+                if (kv.second.open && !kv.second.reconciled && kv.second.symbol == resolvedSym) {
+                    long long units = kv.second.volume / 100LL;
+                    if (units == 0) units = 1;
+                    if (kv.second.tradeSide == 2) units = -units; // SELL = negative
+                    netAmount += units;
+                    // Accumulate for weighted average entry price
+                    totalEntry += kv.second.openPrice * (double)kv.second.volume;
+                    totalVol += kv.second.volume;
+                }
+            }
+            // Cache avg entry for GET_AVGENTRY
+            G.lastPositionAvgEntry = (totalVol > 0) ? (totalEntry / (double)totalVol) : 0.0;
+            Log::Info("CMD", "GET_POSITION(%s -> %s) = %lld (avgEntry=%.5f, reconciled excluded)",
+                      posSym, resolvedSym.c_str(), netAmount, G.lastPositionAvgEntry);
+            return (double)netAmount;
         }
+
+        case GET_AVGENTRY: // 55 - average entry price from preceding GET_POSITION
+            return G.lastPositionAvgEntry;
 
         case DO_CANCEL: { // 301 - cancel pending order
             int tradeId = (int)dwParameter;
@@ -1045,7 +1273,7 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             return 8000;
 
         default:
-            Log::Diag(1, "CMD", "Unhandled command %d (param=%lu)", Command, dwParameter);
+            Log::Diag(1, "CMD Unhandled command %d (param=%lu)", Command, dwParameter);
             return 0;
     }
 }
