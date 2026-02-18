@@ -84,6 +84,15 @@ void Reset() {
     // Current state
     G.currentSymbol.clear();
     G.orderType = 0;
+    G.orderLabel.clear();
+    G.limitPrice = 0.0;
+    G.pendingSL = 0.0;
+    G.pendingTP = 0.0;
+
+    // Reconnect
+    G.reconnectAttempts = 0;
+    G.lastReconnectMs = 0;
+    G.isReconnecting = false;
 
     // Env lock reset for new login (NOT reconnect)
     G.envLocked = false;

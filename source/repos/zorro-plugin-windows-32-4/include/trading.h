@@ -32,4 +32,7 @@ bool RequestReconcile();
 // Cancel a pending order (DO_CANCEL)
 bool CancelOrder(int tradeId);
 
+// Amend SL/TP on an existing open position (M5)
+bool AmendPositionSltp(int tradeId, double stopLoss, double takeProfit);
+
 } // namespace Trading

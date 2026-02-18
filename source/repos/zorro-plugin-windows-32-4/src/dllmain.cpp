@@ -35,9 +35,66 @@ static unsigned __stdcall NetworkThread(void* param) {
             // Log once when we notice disconnection
             static bool loggedDisconnect = false;
             if (!loggedDisconnect) {
-                Log::Warn("NET", "NetworkThread: WS not connected, waiting...");
+                Log::Warn("NET", "NetworkThread: WS not connected");
                 loggedDisconnect = true;
             }
+
+            // Auto-reconnect: only if we had a successful login before
+            if (G.loggedIn && !G.isReconnecting && G.reconnectAttempts < 10) {
+                // Exponential backoff: 5s, 10s, 20s, 40s, 60s (capped)
+                ULONGLONG delay = 5000ULL << (G.reconnectAttempts > 3 ? 3 : G.reconnectAttempts);
+                if (delay > 60000) delay = 60000;
+                ULONGLONG now = GetTickCount64();
+                if (now - G.lastReconnectMs >= delay) {
+                    G.isReconnecting = true;
+                    G.lastReconnectMs = now;
+                    loggedDisconnect = false;
+                    Log::Info("NET", "Auto-reconnect attempt %d/%d (delay=%llums)",
+                              G.reconnectAttempts + 1, 10, delay);
+
+                    // Soft reset connection state (preserve trades/symbols)
+                    StateInit::ResetConnection();
+                    WebSocket::Disconnect();
+
+                    const char* host = G.hostOverride.empty()
+                        ? (G.env == Env::Live ? CTRADER_HOST_LIVE : CTRADER_HOST_DEMO)
+                        : G.hostOverride.c_str();
+
+                    Auth::LoadToken();
+
+                    bool ok = WebSocket::Connect(host, CTRADER_WS_PORT);
+                    if (ok) ok = Auth::ApplicationAuth();
+                    if (ok) {
+                        if (!Auth::AccountAuth()) {
+                            Log::Warn("NET", "Reconnect: AccountAuth failed, refreshing token...");
+                            WebSocket::Disconnect();
+                            if (Auth::RefreshAccessToken()) {
+                                ok = WebSocket::Connect(host, CTRADER_WS_PORT) && Auth::ApplicationAuth() && Auth::AccountAuth();
+                            } else {
+                                ok = false;
+                            }
+                        }
+                    }
+
+                    if (ok) {
+                        // Resubscribe and reconcile
+                        Symbols::BatchResubscribe();
+                        Trading::RequestReconcile();
+                        G.reconnectAttempts = 0;
+                        G.lastHeartbeatMs = GetTickCount64();
+                        Log::Info("NET", "Auto-reconnect SUCCESSFUL");
+                    } else {
+                        G.reconnectAttempts++;
+                        WebSocket::Disconnect();
+                        Log::Error("NET", "Auto-reconnect FAILED (attempt %d/10)", G.reconnectAttempts);
+                        if (G.reconnectAttempts >= 10) {
+                            Log::Error("NET", "Auto-reconnect exhausted, giving up. Manual BrokerLogin required.");
+                        }
+                    }
+                    G.isReconnecting = false;
+                }
+            }
+
             Sleep(100);
             continue;
         }
@@ -148,11 +205,13 @@ static unsigned __stdcall NetworkThread(void* param) {
                 break;
 
             case ToInt(PayloadType::AccountsTokenInvalidatedEvent):
-                Log::Error("NET", "Token invalidated!");
+                Log::Error("NET", "Token invalidated! Triggering reconnect...");
+                G.wsConnected = false;  // triggers auto-reconnect with token refresh
                 break;
 
             case ToInt(PayloadType::ClientDisconnectEvent):
-                Log::Warn("NET", "Client disconnect event");
+                Log::Warn("NET", "Client disconnect event, triggering reconnect...");
+                G.wsConnected = false;  // triggers auto-reconnect
                 break;
 
             default:
@@ -213,7 +272,17 @@ DLLFUNC int BrokerOpen(char* Name, int(__cdecl* fpMessage)(const char*),
     BrokerMessage = fpMessage;
     BrokerProgress = fpProgress;
 
-    if (Name) strcpy_s(Name, 32, PLUGIN_NAME);
+    // Name==NULL signals shutdown (Zorro is closing)
+    if (!Name) {
+        Log::Info("BROKER", "BrokerOpen(NULL): graceful shutdown");
+        StopNetworkThread();
+        WebSocket::Disconnect();
+        G.loggedIn = false;
+        G.loginCompleted = false;
+        return 0;
+    }
+
+    strcpy_s(Name, 32, PLUGIN_NAME);
 
     // Debug: write version + dllDir + log test to known path
     {
@@ -289,6 +358,9 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
         Log::Info("BROKER", "BrokerLogin RECONNECT: user=%s accountId=%lld (preserving trades/symbols)",
                   User, G.accountId);
 
+        // Wait for NetworkThread auto-reconnect to finish if active
+        for (int i = 0; i < 50 && G.isReconnecting; i++) Sleep(100);
+
         // Stop network thread before reconnecting
         StopNetworkThread();
         WebSocket::Disconnect();
@@ -340,6 +412,8 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
         }
 
         G.loggedIn = true;
+        G.reconnectAttempts = 0;
+        G.isReconnecting = false;
 
         // Try to reload symbol list, but continue with cached symbols if it fails
         bool symOk = Symbols::RequestSymbolList();
@@ -443,10 +517,18 @@ DLLFUNC int BrokerTime(DATE* pTimeGMT) {
 
     if (G.quoteCount == 0) return 1;
 
-    // If no SpotEvent received for >60 seconds, market is likely closed
+    // If no SpotEvent received for >60 seconds, check if WS is still alive
     ULONGLONG now = GetTickCount64();
     if (G.lastQuoteRecvMs > 0 && (now - G.lastQuoteRecvMs) > 60000) {
-        return 1;  // connected but no live data
+        // WS is still connected, market is likely closed (weekend/holiday)
+        // But if heartbeats are also not going through, connection may be stale
+        if (G.lastHeartbeatMs > 0 && (now - G.lastHeartbeatMs) > 35000) {
+            // No heartbeat in 35s (API timeout is 30s) -> connection is dead
+            Log::Warn("TIME", "No heartbeat in %llums, connection stale", now - G.lastHeartbeatMs);
+            G.wsConnected = false;  // trigger reconnect
+            return 0;
+        }
+        return 1;  // connected but no live data (market closed)
     }
 
     return 2;
@@ -983,6 +1065,13 @@ DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
     T6* bars = (T6*)ticks;
     int totalBars = 0;
 
+    // Compute live spread for bar fVal (trendbars are BID-only, no ASK available)
+    float liveSpread = 0.0f;
+    if (sym.bid > 0.0 && sym.ask > 0.0 && sym.ask > sym.bid) {
+        liveSpread = (float)(sym.ask - sym.bid);
+    }
+    Log::Diag(1, "HIST Live spread for bars: %.5f (bid=%.5f ask=%.5f)", liveSpread, sym.bid, sym.ask);
+
     // Cap bars per chunk to keep JSON response size manageable (~150KB)
     const int MAX_BARS_PER_CHUNK = 1500;
 
@@ -1096,7 +1185,7 @@ DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
             bar.fOpen  = (float)((double)(low + deltaOpen) / PRICE_SCALE);
             bar.fClose = (float)((double)(low + deltaClose) / PRICE_SCALE);
             bar.fVol   = (float)volume;
-            bar.fVal   = 0.0f;  // spread - not available from trendbars
+            bar.fVal   = liveSpread;  // spread from live SpotEvent quotes
             bar.time   = Utils::MinutesToOle(tsMinutes);
 
             // Debug: log first 3 bars and any anomalies
@@ -1215,6 +1304,19 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             return ((double)sym.maxVolume / 100.0) / lotAmount;
         }
 
+        case GET_DIGITS: { // 12 - number of digits after decimal point
+            SymbolInfo sym;
+            if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
+            return (double)sym.digits;
+        }
+
+        case GET_STOPLEVEL: { // 14 - minimum stop distance in pips (0=none)
+            return 0;  // cTrader doesn't provide a fixed stop level; server validates
+        }
+
+        case GET_BROKERZONE: // 40 - broker timezone offset (0=UTC)
+            return 0;
+
         case GET_COMPLIANCE: // 51 - NFA flags (0=no restrictions)
             return 0;
 
@@ -1260,6 +1362,13 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             return (double)netAmount;
         }
 
+        case GET_ACCOUNT: { // 54 - account ID as string in dwParameter
+            if (dwParameter) {
+                sprintf_s((char*)dwParameter, 256, "%lld", G.accountId);
+            }
+            return 1;
+        }
+
         case GET_AVGENTRY: // 55 - average entry price from preceding GET_POSITION
             return G.lastPositionAvgEntry;
 
@@ -1269,8 +1378,57 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             return Trading::CancelOrder(tradeId) ? 1.0 : 0.0;
         }
 
+        case SET_ORDERTEXT: // 131 - set order label/comment
+            if (dwParameter) {
+                G.orderLabel = (const char*)dwParameter;
+            } else {
+                G.orderLabel.clear();
+            }
+            return 1;
+
+        case SET_LIMIT: // 135 - set limit price for next order
+            if (dwParameter) {
+                G.limitPrice = *(double*)dwParameter;
+            } else {
+                G.limitPrice = 0.0;
+            }
+            return 1;
+
+        case GET_LOCK: // 46 - enter critical section (multi-thread safety)
+            EnterCriticalSection(&G.csTrades);
+            return 1;
+
+        case SET_LOCK: // 171 - leave critical section
+            LeaveCriticalSection(&G.csTrades);
+            return 1;
+
         case GET_MAXTICKS: // 43 - max ticks for history
             return 8000;
+
+        case SET_STOPLOSS: // 2001 - set pending SL price for AmendPositionSltp
+            if (dwParameter) {
+                G.pendingSL = *(double*)dwParameter;
+            } else {
+                G.pendingSL = 0.0;
+            }
+            return 1;
+
+        case SET_TAKEPROFIT: // 2002 - set pending TP price for AmendPositionSltp
+            if (dwParameter) {
+                G.pendingTP = *(double*)dwParameter;
+            } else {
+                G.pendingTP = 0.0;
+            }
+            return 1;
+
+        case DO_MODIFY_SLTP: { // 2003 - send AmendPositionSltpReq
+            int tradeId = (int)dwParameter;
+            if (tradeId <= 0) return 0;
+            bool ok = Trading::AmendPositionSltp(tradeId, G.pendingSL, G.pendingTP);
+            G.pendingSL = 0.0;
+            G.pendingTP = 0.0;
+            return ok ? 1.0 : 0.0;
+        }
 
         default:
             Log::Diag(1, "CMD Unhandled command %d (param=%lu)", Command, dwParameter);

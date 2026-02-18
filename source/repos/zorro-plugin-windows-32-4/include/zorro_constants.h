@@ -55,3 +55,8 @@
 
 // DO_* commands
 #define DO_CANCEL           301
+
+// Custom plugin commands (M5: SL/TP modification)
+#define SET_STOPLOSS        2001  // *(double*)dwParameter = SL price (0 = remove)
+#define SET_TAKEPROFIT      2002  // *(double*)dwParameter = TP price (0 = remove)
+#define DO_MODIFY_SLTP      2003  // dwParameter = tradeId -> send AmendPositionSltpReq

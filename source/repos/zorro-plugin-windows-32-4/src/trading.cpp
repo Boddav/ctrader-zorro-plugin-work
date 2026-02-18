@@ -112,12 +112,25 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
     int cTraderOrderType = 1;  // default Market
     double orderPrice = 0.0;
 
-    if (G.orderType == 2 && limit > 0.0) {
+    // SET_LIMIT may provide the price via G.limitPrice instead of BrokerBuy2 Limit param
+    double effectiveLimit = limit;
+    if (effectiveLimit <= 0.0 && G.limitPrice > 0.0) {
+        effectiveLimit = G.limitPrice;
+    }
+
+    if (G.orderType == 2 && effectiveLimit > 0.0) {
         cTraderOrderType = 2;
-        orderPrice = limit;
-    } else if (G.orderType == 3 && limit > 0.0) {
-        cTraderOrderType = 3;
-        orderPrice = limit;
+        orderPrice = effectiveLimit;
+    } else if (G.orderType == 3 && effectiveLimit > 0.0) {
+        // StopLimit: if both stopPrice (limit param) and limitPrice (SET_LIMIT) are set
+        if (G.limitPrice > 0.0 && effectiveLimit != G.limitPrice) {
+            cTraderOrderType = 6;  // StopLimit
+            orderPrice = effectiveLimit;  // BrokerBuy2 Limit param = stop trigger price
+            // G.limitPrice will be used as execution limit price below
+        } else {
+            cTraderOrderType = 3;
+            orderPrice = effectiveLimit;
+        }
     }
 
     // Allocate zorroId
@@ -128,6 +141,14 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
     }
 
     // Build NewOrderReq payload
+    // Label: use SET_ORDERTEXT value if set, otherwise default "z_{zorroId}"
+    char labelBuf[128];
+    if (!G.orderLabel.empty()) {
+        sprintf_s(labelBuf, "%s", G.orderLabel.c_str());
+    } else {
+        sprintf_s(labelBuf, "z_%d", zorroId);
+    }
+
     char payload[1024];
     int off = sprintf_s(payload,
         "\"ctidTraderAccountId\":%lld,"
@@ -135,8 +156,8 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
         "\"orderType\":%d,"
         "\"tradeSide\":%d,"
         "\"volume\":%lld,"
-        "\"label\":\"z_%d\"",
-        G.accountId, sym.symbolId, cTraderOrderType, tradeSide, vol, zorroId);
+        "\"label\":\"%s\"",
+        G.accountId, sym.symbolId, cTraderOrderType, tradeSide, vol, labelBuf);
 
     // Add limit/stop price for pending orders
     if (cTraderOrderType == 2 && orderPrice > 0.0) {
@@ -145,22 +166,53 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
     } else if (cTraderOrderType == 3 && orderPrice > 0.0) {
         off += sprintf_s(payload + off, sizeof(payload) - off,
             ",\"stopPrice\":%.0f", orderPrice * PRICE_SCALE);
+    } else if (cTraderOrderType == 6 && orderPrice > 0.0) {
+        // StopLimit: stopPrice = trigger, limitPrice = execution limit
+        off += sprintf_s(payload + off, sizeof(payload) - off,
+            ",\"stopPrice\":%.0f,\"limitPrice\":%.0f",
+            orderPrice * PRICE_SCALE, G.limitPrice * PRICE_SCALE);
+    }
+
+    // SL/TP handling:
+    // Zorro convention: stopDist > 0 = stop loss distance, stopDist < 0 = take profit distance
+    double slDist = 0.0;
+    double tpDist = 0.0;
+    if (stopDist > 0.0) {
+        slDist = stopDist;
+    } else if (stopDist < 0.0) {
+        tpDist = -stopDist;  // make positive
     }
 
     // SL for market orders: use relativeStopLoss (distance in points)
     // cTrader rejects absolute SL/TP on market orders
-    if (cTraderOrderType == 1 && stopDist > 0.0) {
-        long long slPoints = (long long)(stopDist * PRICE_SCALE);
+    if (cTraderOrderType == 1 && slDist > 0.0) {
+        long long slPoints = (long long)(slDist * PRICE_SCALE);
         off += sprintf_s(payload + off, sizeof(payload) - off,
             ",\"relativeStopLoss\":%lld", slPoints);
     }
 
+    // TP for market orders: use relativeTakeProfit (distance in points)
+    if (cTraderOrderType == 1 && tpDist > 0.0) {
+        long long tpPoints = (long long)(tpDist * PRICE_SCALE);
+        off += sprintf_s(payload + off, sizeof(payload) - off,
+            ",\"relativeTakeProfit\":%lld", tpPoints);
+    }
+
     // SL for limit/stop orders: use absolute stopLoss price
-    if (cTraderOrderType != 1 && stopDist > 0.0) {
-        double slPrice = (tradeSide == 1) ? (orderPrice - stopDist) : (orderPrice + stopDist);
+    if (cTraderOrderType != 1 && slDist > 0.0) {
+        double slPrice = (tradeSide == 1) ? (orderPrice - slDist) : (orderPrice + slDist);
         if (slPrice > 0.0) {
             off += sprintf_s(payload + off, sizeof(payload) - off,
                 ",\"stopLoss\":%.0f", slPrice * PRICE_SCALE);
+        }
+    }
+
+    // TP for limit/stop orders: use absolute takeProfit price
+    if (cTraderOrderType != 1 && tpDist > 0.0) {
+        double tpPrice = (tradeSide == 1) ? (orderPrice + tpDist) : (orderPrice - tpDist);
+        if (tpPrice > 0.0) {
+            off += sprintf_s(payload + off, sizeof(payload) - off,
+                ",\"takeProfit\":%.0f", tpPrice * PRICE_SCALE);
         }
     }
 
@@ -178,9 +230,9 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
 
     const char* msg = Protocol::BuildMessage(msgId, PayloadType::NewOrderReq, payload);
 
-    Log::Info("TRADE", "NewOrder: %s %s amount=%d vol=%lld type=%d zorroId=%d stopDist=%.5f limit=%.5f orderPrice=%.5f",
+    Log::Info("TRADE", "NewOrder: %s %s amount=%d vol=%lld type=%d zorroId=%d SL=%.5f TP=%.5f limit=%.5f orderPrice=%.5f label=%s",
               (tradeSide == 1) ? "BUY" : "SELL", asset, amount, vol, cTraderOrderType, zorroId,
-              stopDist, limit, orderPrice);
+              slDist, tpDist, effectiveLimit, orderPrice, labelBuf);
 
     // Set waiting flag and send
     {
@@ -289,6 +341,9 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
 
                 Log::Info("TRADE", "Order filled: zorroId=%d posId=%lld price=%.5f vol=%lld",
                           zorroId, posId, execPrice, filledVol);
+                // Reset per-order state
+                G.limitPrice = 0.0;
+                G.orderLabel.clear();
                 return zorroId;
             }
             else if (execType == 2) {
@@ -322,8 +377,13 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
                     G.pendingActions.erase(msgId);
                 }
 
+                if (pPrice) *pPrice = orderPrice;
+
                 Log::Info("TRADE", "Pending order accepted: zorroId=%d orderId=%lld price=%.5f",
                           zorroId, ordId, orderPrice);
+                // Reset per-order state
+                G.limitPrice = 0.0;
+                G.orderLabel.clear();
                 return -zorroId;  // negative = pending
             }
             else if (execType == 7) {
@@ -374,6 +434,9 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
         CsLock lock(G.csTrades);
         G.pendingActions.erase(msgId);
     }
+    // Reset per-order state
+    G.limitPrice = 0.0;
+    G.orderLabel.clear();
     return 0;
 }
 
@@ -1034,6 +1097,146 @@ bool CancelOrder(int tradeId) {
         Log::Error("TRADE", "CancelOrder error: %s", desc);
     }
 
+    return false;
+}
+
+// ============================================================
+// AmendPositionSltp - modify SL/TP on an existing position
+// ============================================================
+
+bool AmendPositionSltp(int tradeId, double stopLoss, double takeProfit) {
+    if (!G.loggedIn) return false;
+
+    int lookupId = abs(tradeId);
+
+    // Lookup trade
+    TradeInfo ti;
+    {
+        CsLock lock(G.csTrades);
+        auto it = G.trades.find(lookupId);
+
+        // Check alias cache
+        if (it == G.trades.end()) {
+            auto aliasIt = G.tradeIdAlias.find(lookupId);
+            if (aliasIt != G.tradeIdAlias.end()) {
+                it = G.trades.find(aliasIt->second);
+                if (it != G.trades.end()) lookupId = aliasIt->second;
+            }
+        }
+
+        if (it == G.trades.end()) {
+            Log::Error("TRADE", "AmendSLTP: tradeId=%d not found", tradeId);
+            return false;
+        }
+        ti = it->second;
+    }
+
+    if (!ti.open || ti.positionId <= 0) {
+        Log::Error("TRADE", "AmendSLTP: tradeId=%d not open or no positionId", tradeId);
+        return false;
+    }
+
+    // Build AmendPositionSltpReq payload
+    char payload[512];
+    int off = sprintf_s(payload,
+        "\"ctidTraderAccountId\":%lld,"
+        "\"positionId\":%lld",
+        G.accountId, ti.positionId);
+
+    // SL: 0 = omit field (removes SL), >0 = set SL price
+    if (stopLoss > 0.0) {
+        off += sprintf_s(payload + off, sizeof(payload) - off,
+            ",\"stopLoss\":%.0f", stopLoss * PRICE_SCALE);
+    }
+
+    // TP: 0 = omit field (removes TP), >0 = set TP price
+    if (takeProfit > 0.0) {
+        off += sprintf_s(payload + off, sizeof(payload) - off,
+            ",\"takeProfit\":%.0f", takeProfit * PRICE_SCALE);
+    }
+
+    const char* msgId = Utils::NextMsgId();
+    const char* msg = Protocol::BuildMessage(msgId, PayloadType::AmendPositionSltpReq, payload);
+
+    Log::Info("TRADE", "AmendSLTP: tradeId=%d posId=%lld SL=%.5f TP=%.5f",
+              lookupId, ti.positionId, stopLoss, takeProfit);
+
+    // Set waiting flag and send
+    {
+        CsLock lock(G.csTrading);
+        ResetTradingBuffer();
+        G.waitingForTrading = true;
+    }
+
+    if (!WebSocket::Send(msg)) {
+        Log::Error("TRADE", "AmendSLTP send failed");
+        G.waitingForTrading = false;
+        return false;
+    }
+
+    // Wait for ExecutionEvent (execType=2 ACCEPTED) or error
+    for (int eventCount = 0; eventCount < 5; eventCount++) {
+        bool gotResponse = WaitForTradingResponse(G.waitTime);
+
+        if (!gotResponse) {
+            G.waitingForTrading = false;
+            Log::Error("TRADE", "AmendSLTP timeout (%dms)", G.waitTime);
+            return false;
+        }
+
+        CsLock tlock(G.csTrading);
+        int pt = G.tradingResponsePt;
+
+        if (pt == ToInt(PayloadType::ErrorRes)) {
+            G.waitingForTrading = false;
+            const char* desc = Protocol::ExtractString(G.tradingResponseBuf, "description");
+            Log::Error("TRADE", "AmendSLTP error: %s", desc);
+            return false;
+        }
+
+        if (pt == ToInt(PayloadType::OrderErrorEvent)) {
+            G.waitingForTrading = false;
+            const char* desc = Protocol::ExtractString(G.tradingResponseBuf, "description");
+            Log::Error("TRADE", "AmendSLTP order error: %s", desc);
+            return false;
+        }
+
+        if (pt == ToInt(PayloadType::ExecutionEvent)) {
+            int execType = G.tradingResponseExecType;
+
+            if (execType == 2) {
+                // ACCEPTED — SL/TP modification successful
+                G.waitingForTrading = false;
+
+                // Update trade state
+                {
+                    CsLock lock(G.csTrades);
+                    auto it = G.trades.find(lookupId);
+                    if (it != G.trades.end()) {
+                        it->second.stopLoss = stopLoss;
+                        it->second.takeProfit = takeProfit;
+                    }
+                }
+
+                Log::Info("TRADE", "AmendSLTP success: tradeId=%d SL=%.5f TP=%.5f",
+                          lookupId, stopLoss, takeProfit);
+                return true;
+            }
+
+            // Other execType — skip and keep waiting
+            Log::Info("TRADE", "AmendSLTP event execType=%d, waiting...", execType);
+            ResetTradingBuffer();
+            continue;
+        }
+
+        // Unknown pt — skip
+        Log::Info("TRADE", "AmendSLTP: skipping unexpected pt=%d", pt);
+        ResetTradingBuffer();
+        continue;
+    }
+
+    G.waitingForTrading = false;
+    Log::Error("TRADE", "AmendSLTP: too many events without ACCEPTED");
     return false;
 }
 

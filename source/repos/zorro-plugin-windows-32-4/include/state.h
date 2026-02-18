@@ -169,6 +169,19 @@ struct State {
     int waitTime = 30000;  // default 30s timeout
     double lastPositionAvgEntry = 0.0;  // cached for GET_AVGENTRY (set by GET_POSITION)
 
+    // Reconnect state
+    int reconnectAttempts = 0;
+    ULONGLONG lastReconnectMs = 0;
+    volatile bool isReconnecting = false;
+
+    // BrokerCommand state (F2)
+    std::string orderLabel;
+    double limitPrice = 0.0;
+
+    // AmendPositionSltp state (M5)
+    double pendingSL = 0.0;
+    double pendingTP = 0.0;
+
     // Subscription tracking
     int quoteCount = 0;
     ULONGLONG subscriptionStartMs = 0;
@@ -197,7 +210,7 @@ extern State G;
 // Constants
 constexpr int PLUGIN_TYPE = 2;
 constexpr const char* PLUGIN_NAME = "cTrader";
-constexpr const char* PLUGIN_VERSION = "4.0.6";
+constexpr const char* PLUGIN_VERSION = "4.2.0";
 constexpr const char* CTRADER_HOST_DEMO = "demo.ctraderapi.com";
 constexpr const char* CTRADER_HOST_LIVE = "live.ctraderapi.com";
 constexpr int CTRADER_WS_PORT = 5036;
