@@ -71,6 +71,7 @@ struct TradeInfo {
     double profit = 0.0;
     double commission = 0.0;
     double swap = 0.0;
+    double usedMargin = 0.0;      // server-reported margin for this position
     long long openTime = 0;
     bool open = true;
     bool reconciled = false;      // true = loaded from server at login, NOT opened by Zorro this session

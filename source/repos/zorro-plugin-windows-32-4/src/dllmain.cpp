@@ -572,7 +572,7 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
     }
 
     if (pLotAmount) {
-        // 1 Zorro Amount unit = 100 cTrader volume units = 100 base currency units
+        // 1 Zorro Amount unit = 100 cTrader volume units
         // Must match ZorroToVolume: volume = abs(amount) * 100
         *pLotAmount = 100.0;
     }
@@ -659,9 +659,34 @@ DLLFUNC int BrokerAccount(char* Account, double* pBalance, double* pTradeVal,
         *pTradeVal = totalPnL;
     }
 
-    if (pMarginVal) *pMarginVal = G.margin;
+    if (pMarginVal) {
+        // Use server-reported MarginChangedEvent if available
+        if (G.margin > 0.0) {
+            *pMarginVal = G.margin;
+        } else {
+            // Fallback: sum per-position usedMargin from ExecutionEvent/Reconcile
+            double totalMargin = 0.0;
+            CsLock lock(G.csTrades);
+            for (auto& kv : G.trades) {
+                if (kv.second.open && kv.second.positionId > 0) {
+                    totalMargin += kv.second.usedMargin;
+                }
+            }
+            *pMarginVal = totalMargin;
+        }
+    }
 
     return 1;
+}
+
+// Non-extended BrokerBuy: fallback for Zorro compatibility
+DLLFUNC int BrokerBuy(char* Asset, int Amount, double StopDist, double* pPrice) {
+    Log::Info("BROKER", "BrokerBuy ENTER: Asset=%s Amount=%d StopDist=%.5f",
+              Asset ? Asset : "NULL", Amount, StopDist);
+    int result = Trading::BuyOrder(Asset, Amount, StopDist, 0.0, pPrice, NULL);
+    Log::Info("BROKER", "BrokerBuy RETURN: %d pPrice=%.5f",
+              result, pPrice ? *pPrice : 0.0);
+    return result;
 }
 
 DLLFUNC int BrokerBuy2(char* Asset, int Amount, double StopDist, double Limit,
@@ -671,6 +696,16 @@ DLLFUNC int BrokerBuy2(char* Asset, int Amount, double StopDist, double Limit,
     int result = Trading::BuyOrder(Asset, Amount, StopDist, Limit, pPrice, pFill);
     Log::Info("BROKER", "BrokerBuy2 RETURN: %d pPrice=%.5f pFill=%d",
               result, pPrice ? *pPrice : 0.0, pFill ? *pFill : -999);
+    return result;
+}
+
+// Non-extended BrokerSell: Zorro may call this during script stop/exit
+// even with PLUGIN_TYPE=2. Without this export, Zorro gets "function not found"
+// and logs "can't close" before falling back to BrokerSell2.
+DLLFUNC int BrokerSell(int TradeID, int Amount) {
+    Log::Info("BROKER", "BrokerSell ENTER: TradeID=%d Amount=%d", TradeID, Amount);
+    int result = Trading::SellOrder(TradeID, Amount, 0.0, NULL, NULL, NULL, NULL);
+    Log::Info("BROKER", "BrokerSell RETURN: %d", result);
     return result;
 }
 
@@ -1331,19 +1366,17 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             G.waitTime = (int)dwParameter;
             return 1;
 
-        case SET_PRICETYPE: // 151
-            return 1;  // supported
+        case SET_PRICETYPE: // 151 - bid/ask/last price selection
+            return 0;  // not supported (always uses ask for buy, bid for sell)
 
         case GET_MINLOT: { // 23
             SymbolInfo sym;
             if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
             if (sym.lotSize <= 0) return 0;
-            // LotAmount = lotSize/10000 (micro-lot). MinLot = min_units / LotAmount.
-            // min_units = minVolume / 100 (cTrader cents → base units)
-            double lotAmount = (double)sym.lotSize / 10000.0;
-            double minLot = ((double)sym.minVolume / 100.0) / lotAmount;
-            Log::Diag(1, "CMD GET_MINLOT %s: minVol=%lld lotSize=%lld lotAmt=%.0f -> %.4f",
-                      G.currentSymbol.c_str(), sym.minVolume, sym.lotSize, lotAmount, minLot);
+            // LotAmount=100. MinLot = (minVolume/100) / LotAmount = minVolume/10000
+            double minLot = (double)sym.minVolume / 10000.0;
+            Log::Diag(1, "CMD GET_MINLOT %s: minVol=%lld lotSize=%lld -> %.4f",
+                      G.currentSymbol.c_str(), sym.minVolume, sym.lotSize, minLot);
             return minLot;
         }
 
@@ -1351,16 +1384,14 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             SymbolInfo sym;
             if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
             if (sym.lotSize <= 0) return 0;
-            double lotAmount = (double)sym.lotSize / 10000.0;
-            return ((double)sym.stepVolume / 100.0) / lotAmount;
+            return (double)sym.stepVolume / 10000.0;
         }
 
         case GET_MAXLOT: { // 25
             SymbolInfo sym;
             if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
             if (sym.lotSize <= 0) return 0;
-            double lotAmount = (double)sym.lotSize / 10000.0;
-            return ((double)sym.maxVolume / 100.0) / lotAmount;
+            return (double)sym.maxVolume / 10000.0;
         }
 
         case GET_DIGITS: { // 12 - number of digits after decimal point
@@ -1404,7 +1435,10 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             double totalEntry = 0.0;
             long long totalVol = 0;
             for (auto& kv : G.trades) {
-                if (kv.second.open && !kv.second.reconciled && kv.second.symbol == resolvedSym) {
+                // Compare against both Zorro name (e.g. "EUR/USD") and cTrader name (e.g. "EURUSD")
+                // Trade may store either format depending on how it was opened
+                if (kv.second.open && !kv.second.reconciled &&
+                    (kv.second.symbol == resolvedSym || kv.second.symbol == posSym)) {
                     long long units = kv.second.volume / 100LL;
                     if (units == 0) units = 1;
                     if (kv.second.tradeSide == 2) units = -units; // SELL = negative
@@ -1476,19 +1510,26 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             if (!G.loggedIn || !WebSocket::IsConnected()) return 0;
             return 1;  // cTrader server validates trading hours; let it reject if closed
 
-        case GET_TRADES: { // 71 - fill int array with open trade IDs
-            // dwParameter = pointer to int array (Zorro provides buffer)
-            // Returns count of open Zorro-managed trades (not external/reconciled)
+        case GET_TRADES: { // 71 - fill TRADE array with all open positions
+            // dwParameter = pointer to ZorroTrade array (Zorro provides buffer)
+            // Returns count of ALL open positions (including reconciled/external)
+            // This enables brokerTrades() to discover orphaned positions after restart
             if (!dwParameter) return 0;
-            int* pIds = (int*)dwParameter;
+            ZorroTrade* trades = (ZorroTrade*)dwParameter;
             int count = 0;
             CsLock lock(G.csTrades);
             for (auto& kv : G.trades) {
-                if (kv.second.open && !kv.second.reconciled && kv.second.positionId > 0) {
-                    pIds[count++] = kv.first;  // zorroId
+                if (kv.second.open && kv.second.positionId > 0) {
+                    memset(&trades[count], 0, sizeof(ZorroTrade));
+                    trades[count].nID = kv.first;  // zorroId
+                    trades[count].nLots = (int)(kv.second.volume / 100LL);
+                    if (trades[count].nLots == 0) trades[count].nLots = 1;
+                    trades[count].flags = TR_OPEN | ((kv.second.tradeSide == 2) ? TR_SHORT : TR_LONG);
+                    trades[count].fEntryPrice = (float)kv.second.openPrice;
+                    count++;
                 }
             }
-            Log::Info("CMD", "GET_TRADES: %d open Zorro trades returned", count);
+            Log::Info("CMD", "GET_TRADES: %d open positions returned (sizeof ZorroTrade=%d)", count, (int)sizeof(ZorroTrade));
             return (double)count;
         }
 
@@ -1505,6 +1546,44 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             if (dwParameter) {
                 G.hostOverride = (const char*)dwParameter;
                 Log::Info("CMD", "SET_SERVER: %s", G.hostOverride.c_str());
+            }
+            return 1;
+
+        case GET_TIME: { // 5 - last incoming quote time (OLE DATE in server timezone)
+            if (G.lastQuoteRecvMs == 0) return 0;
+            SYSTEMTIME st;
+            GetSystemTime(&st);
+            DATE oleDate;
+            SystemTimeToVariantTime(&st, &oleDate);
+            return oleDate;
+        }
+
+        case GET_MARGININIT: { // 29 - initial margin per lot
+            // Margin = LotAmount * price / leverage
+            SymbolInfo sym;
+            if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
+            double price = sym.ask > 0.0 ? sym.ask : sym.bid;
+            if (price <= 0.0 || G.leverageInCents <= 0) return 0;
+            double leverage = (double)G.leverageInCents / 100.0;
+            double lotAmount = 100.0;  // matches BrokerAsset pLotAmount
+            return lotAmount * price / leverage;
+        }
+
+        case GET_MARGINMAINTAIN: // 30 - maintenance margin (same as init for cTrader)
+            return BrokerCommand(GET_MARGININIT, dwParameter);
+
+        case GET_MARGINHEDGED: // 31 - hedged margin (cTrader uses netting, same as init)
+            return BrokerCommand(GET_MARGININIT, dwParameter);
+
+        case GET_DELAY: // 41 - delay between commands in ms (0=none)
+            return 0;
+
+        case GET_WAIT: // 42 - current wait/timeout in ms
+            return (double)G.waitTime;
+
+        case SET_COMMENT: // 180 - display text in broker platform (same as SET_ORDERTEXT)
+            if (dwParameter) {
+                G.orderLabel = (const char*)dwParameter;
             }
             return 1;
 

@@ -97,8 +97,9 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
     }
 
     if (vol < sym.minVolume) {
-        Log::Warn("TRADE", "BuyOrder: volume %lld below minimum %lld, clamping", vol, sym.minVolume);
-        vol = sym.minVolume;
+        Log::Error("TRADE", "BuyOrder: volume %lld below minimum %lld, REJECTED (increase Lots or LotAmount)",
+                   vol, sym.minVolume);
+        return 0;  // reject: don't clamp, avoids Amount/pFill mismatch
     }
     if (vol > sym.maxVolume) {
         Log::Warn("TRADE", "BuyOrder: volume %lld above maximum %lld, clamping", vol, sym.maxVolume);
@@ -124,7 +125,7 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
         effectiveLimit = G.limitPrice;
     }
 
-    if (G.orderType == 2 && effectiveLimit > 0.0) {
+    if ((G.orderType == 0 || G.orderType == 2) && effectiveLimit > 0.0) {
         cTraderOrderType = 2;
         orderPrice = effectiveLimit;
     } else if (G.orderType == 3 && effectiveLimit > 0.0) {
@@ -331,6 +332,10 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
                     ti.swap = swap;
                     ti.openTime = Utils::NowMs();
                     ti.open = true;
+                    // Extract usedMargin from FILLED event's position data
+                    if (Protocol::HasField(buf, "usedMargin")) {
+                        ti.usedMargin = (double)Protocol::ExtractInt64(buf, "usedMargin") / scale;
+                    }
                     G.trades[zorroId] = ti;
                     G.posIdToZorroId[posId] = zorroId;
                     G.pendingActions.erase(msgId);
@@ -656,7 +661,8 @@ int SellOrder(int tradeId, int amount, double limit,
                           lookupId, closePrice, profit,
                           fullyClosed ? "" : "(still open)");
 
-                return fullyClosed ? 0 : lookupId;
+                // BrokerSell2 return: tradeId = success, 0 = failure
+                return lookupId;
             }
             else if (execType == 2 || execType == 4 || execType == 5) {
                 // ACCEPTED / ORDER_REPLACED / ORDER_CANCELLED
@@ -1000,6 +1006,11 @@ void HandleReconcileRes(const char* buffer) {
         ti.swap = swap;
         ti.open = true;
         ti.reconciled = !hasZorroLabel;  // NOT reconciled if Zorro opened it (has z_N label)
+
+        // usedMargin from server (moneyDigits scaled integer)
+        if (Protocol::HasField(elem, "usedMargin")) {
+            ti.usedMargin = (double)Protocol::ExtractInt64(elem, "usedMargin") / scale;
+        }
 
         // SL/TP if present (JSON doubles)
         if (Protocol::HasField(elem, "stopLoss")) {
