@@ -172,11 +172,17 @@ void HandleSymbolByIdRes(const char* buffer) {
         sym.stepVolume = Protocol::ExtractInt64(elem, "stepVolume");
         sym.swapLong = Protocol::ExtractDouble(elem, "swapLong");
         sym.swapShort = Protocol::ExtractDouble(elem, "swapShort");
+        sym.swapCalculationType = Protocol::ExtractInt(elem, "swapCalculationType");
 
         // Default lotSize if not set
         if (sym.lotSize <= 0) sym.lotSize = 100000;
         if (sym.minVolume <= 0) sym.minVolume = 1000;
         if (sym.stepVolume <= 0) sym.stepVolume = 1000;
+
+        Log::Info("SYM", "DETAIL %s: lotSize=%lld minVol=%lld maxVol=%lld stepVol=%lld pipPos=%d digits=%d base=%lld quote=%lld swapL=%.4f swapS=%.4f swapType=%d",
+                  it->second.c_str(), sym.lotSize, sym.minVolume, sym.maxVolume, sym.stepVolume,
+                  sym.pipPosition, sym.digits, sym.baseAssetId, sym.quoteAssetId,
+                  sym.swapLong, sym.swapShort, sym.swapCalculationType);
     }
 
     Log::Info("SYM", "Updated details for %d symbols", count);
@@ -299,6 +305,55 @@ static std::string FindSymbolName(const char* name) {
     }
 
     return "";  // Not found
+}
+
+void HandleExpectedMarginRes(const char* buffer) {
+    // ExpectedMarginRes does NOT contain symbolId (only ctidTraderAccountId + margin[])
+    // We use G.marginPendingSymbolId set by BrokerAsset before sending the request
+    long long symbolId = G.marginPendingSymbolId;
+    if (symbolId <= 0) {
+        Log::Warn("SYM", "ExpectedMarginRes: no pending symbolId");
+        return;
+    }
+
+    // Parse margin array: [{ "volume": X, "buyMargin": Y, "sellMargin": Z }]
+    const char* arr = Protocol::ExtractArray(buffer, "margin");
+    if (!arr || *arr == '\0') {
+        Log::Warn("SYM", "ExpectedMarginRes: missing margin array for symbolId=%lld", symbolId);
+        return;
+    }
+
+    const char* elem = Protocol::GetArrayElement(arr, 0);
+    if (!elem || !*elem) {
+        Log::Warn("SYM", "ExpectedMarginRes: empty margin element for symbolId=%lld", symbolId);
+        return;
+    }
+
+    long long rawBuy = Protocol::ExtractInt64(elem, "buyMargin");
+    long long rawSell = Protocol::ExtractInt64(elem, "sellMargin");
+
+    // Scale by moneyDigits (e.g. 2 digits → /100.0)
+    double scale = pow(10.0, (double)G.moneyDigits);
+    double buyMargin = (double)rawBuy / scale;
+    double sellMargin = (double)rawSell / scale;
+
+    // Store the higher of buy/sell margin
+    double margin = (buyMargin > sellMargin) ? buyMargin : sellMargin;
+
+    {
+        CsLock lock(G.csSymbols);
+        auto it = G.symbolIdToName.find(symbolId);
+        if (it != G.symbolIdToName.end()) {
+            auto sit = G.symbols.find(it->second);
+            if (sit != G.symbols.end()) {
+                sit->second.marginPerLot = margin;
+                Log::Info("SYM", "MARGIN %s: buy=%.4f sell=%.4f -> marginPerLot=%.4f (raw buy=%lld sell=%lld moneyDigits=%d)",
+                          it->second.c_str(), buyMargin, sellMargin, margin, rawBuy, rawSell, G.moneyDigits);
+            }
+        } else {
+            Log::Warn("SYM", "ExpectedMarginRes: symbolId=%lld not found in map", symbolId);
+        }
+    }
 }
 
 bool GetSymbol(const char* name, SymbolInfo& out) {

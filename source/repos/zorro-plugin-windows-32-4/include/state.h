@@ -47,6 +47,7 @@ struct SymbolInfo {
     long long stepVolume = 1000;
     double swapLong = 0.0;
     double swapShort = 0.0;
+    int swapCalculationType = 0;  // 0=PIPS, 1=PERCENTAGE(annual), 2=POINTS
     double bid = 0.0;
     double ask = 0.0;
     double high = 0.0;
@@ -55,6 +56,7 @@ struct SymbolInfo {
     long long quoteAssetId = 0;
     bool subscribed = false;
     long long lastQuoteTime = 0;
+    double marginPerLot = 0.0;       // from ExpectedMarginRes: margin for volume=10000 (1 Zorro lot)
 };
 
 // Trade/position info
@@ -191,6 +193,11 @@ struct State {
     volatile bool waitingForPnL = false;      // main thread waiting for 2188 response
     volatile bool pnlResponseReady = false;   // NetworkThread signals 2188 arrived
 
+    // Expected Margin cache (M7: per-symbol margin)
+    volatile bool waitingForMargin = false;
+    volatile bool marginResponseReady = false;
+    long long marginPendingSymbolId = 0;      // which symbol we sent ExpectedMarginReq for
+
     // Subscription tracking
     int quoteCount = 0;
     ULONGLONG subscriptionStartMs = 0;
@@ -219,7 +226,7 @@ extern State G;
 // Constants
 constexpr int PLUGIN_TYPE = 2;
 constexpr const char* PLUGIN_NAME = "cTrader";
-constexpr const char* PLUGIN_VERSION = "4.3.0";
+constexpr const char* PLUGIN_VERSION = "4.5.0";
 constexpr const char* CTRADER_HOST_DEMO = "demo.ctraderapi.com";
 constexpr const char* CTRADER_HOST_LIVE = "live.ctraderapi.com";
 constexpr int CTRADER_WS_PORT = 5036;

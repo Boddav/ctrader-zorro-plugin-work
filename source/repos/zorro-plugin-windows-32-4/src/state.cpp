@@ -92,6 +92,11 @@ void Reset() {
     G.waitingForPnL = false;
     G.pnlResponseReady = false;
 
+    // Margin cache (M7)
+    G.waitingForMargin = false;
+    G.marginResponseReady = false;
+    G.marginPendingSymbolId = 0;
+
     // Current state
     G.currentSymbol.clear();
     G.orderType = 0;
@@ -156,6 +161,10 @@ void ResetConnection() {
     // PnL
     G.waitingForPnL = false;
     G.pnlResponseReady = false;
+
+    // Margin (M7)
+    G.waitingForMargin = false;
+    G.marginResponseReady = false;
 
     Log::Info("STATE", "Connection state reset (trades/symbols preserved)");
 }

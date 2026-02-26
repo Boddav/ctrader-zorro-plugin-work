@@ -24,6 +24,9 @@ void HandleSymbolsListRes(const char* buffer);
 // Process SymbolByIdRes
 void HandleSymbolByIdRes(const char* buffer);
 
+// Process ExpectedMarginRes (M7: per-symbol margin)
+void HandleExpectedMarginRes(const char* buffer);
+
 // Lookup symbol by name (thread-safe)
 bool GetSymbol(const char* name, SymbolInfo& out);
 

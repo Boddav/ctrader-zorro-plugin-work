@@ -16,6 +16,67 @@
 #include <oleauto.h>  // VariantTimeToSystemTime
 
 // ============================================================
+// M7: LotAmount helper - clamps to minimum 1.0 for CFD indices
+// lotSize is in cents (100 cents = 1 base unit)
+// Forex: 10M -> 1000, Gold: 10K -> 1, Index: 100 -> 1 (clamped)
+// ============================================================
+static double ComputeLotAmount(long long lotSize) {
+    double la = (double)lotSize / 10000.0;
+    if (la < 1.0 && lotSize > 0) la = 1.0;  // CFD/index minimum
+    return la > 0.0 ? la : 1.0;
+}
+
+// ============================================================
+// M7b: Convert cTrader swap to Zorro pRollLong/pRollShort
+// Zorro expects: $/day per 10K units (forex) or per contract (others)
+// cTrader swapCalculationType: 0=PIPS, 1=PERCENTAGE(annual), 2=POINTS
+// ============================================================
+static double ConvertSwapToZorro(double swapValue, const SymbolInfo& sym) {
+    if (swapValue == 0.0) return 0.0;
+
+    double lotAmount = ComputeLotAmount(sym.lotSize);
+    // Forex heuristic: LotAmount >= 100 (lotSize >= 1M cents = 10K+ base units)
+    bool isForex = (lotAmount >= 100.0);
+
+    switch (sym.swapCalculationType) {
+    case 0: { // PIPS
+        double pip = pow(10.0, -(double)sym.pipPosition);
+        if (isForex) {
+            // Zorro: $ per 10,000 base currency units per day
+            // = swapPips × pip × 10000 (× quoteToAccountRate, TODO)
+            return swapValue * pip * 10000.0;
+        } else {
+            // Zorro: $ per contract (= per LotAmount units) per day
+            // = swapPips × pip × LotAmount (× quoteToAccountRate, TODO)
+            return swapValue * pip * lotAmount;
+        }
+    }
+    case 1: { // PERCENTAGE (annual)
+        double price = (sym.bid + sym.ask) / 2.0;
+        if (price <= 0.0) price = sym.ask > 0.0 ? sym.ask : sym.bid;
+        if (price <= 0.0) return 0.0;
+        double dailyFraction = swapValue / 100.0 / 365.0;
+        if (isForex) {
+            return dailyFraction * price * 10000.0;
+        } else {
+            return dailyFraction * price * lotAmount;
+        }
+    }
+    case 2: { // POINTS (uses digits instead of pipPosition)
+        double point = pow(10.0, -(double)sym.digits);
+        if (isForex) {
+            return swapValue * point * 10000.0;
+        } else {
+            return swapValue * point * lotAmount;
+        }
+    }
+    default:
+        // Unknown type: pass raw value (backwards compatible)
+        return swapValue;
+    }
+}
+
+// ============================================================
 // Network Thread - receives messages and dispatches
 // ============================================================
 
@@ -202,6 +263,11 @@ static unsigned __stdcall NetworkThread(void* param) {
             case ToInt(PayloadType::GetPositionUnrealizedPnLRes):
                 Trading::HandleUnrealizedPnLRes(buffer);
                 if (G.waitingForPnL) G.pnlResponseReady = true;
+                break;
+
+            case ToInt(PayloadType::ExpectedMarginRes):
+                Symbols::HandleExpectedMarginRes(buffer);
+                if (G.waitingForMargin) G.marginResponseReady = true;
                 break;
 
             case ToInt(PayloadType::ErrorRes):
@@ -563,6 +629,43 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
 
     if (sym.bid <= 0.0 && sym.ask <= 0.0) return 0;
 
+    // M7: Lazy-load per-symbol margin via ExpectedMarginReq
+    if (sym.marginPerLot <= 0.0 && sym.symbolId > 0 && WebSocket::IsConnected()) {
+        G.marginPendingSymbolId = sym.symbolId;
+        G.waitingForMargin = true;
+        G.marginResponseReady = false;
+
+        // Volume for 1 Zorro lot: LotAmount * 100 (in cTrader cents)
+        // Forex(lotSize=10M): 100000, Gold(10K): 100, Index(100): 100 (clamped via ComputeLotAmount)
+        double la = ComputeLotAmount(sym.lotSize);
+        long long marginVolume = (long long)(la * 100.0);
+        if (marginVolume < 1) marginVolume = 1;
+        char marginPayload[256];
+        sprintf_s(marginPayload, "\"ctidTraderAccountId\":%lld,\"symbolId\":%lld,\"volume\":[%lld]",
+                  G.accountId, sym.symbolId, marginVolume);
+
+        const char* marginMsg = Protocol::BuildMessage(Utils::NextMsgId(),
+                                                        PayloadType::ExpectedMarginReq, marginPayload);
+        if (WebSocket::Send(marginMsg)) {
+            // Spin-wait max 3s for response
+            ULONGLONG marginStart = GetTickCount64();
+            while (GetTickCount64() - marginStart < 3000) {
+                if (G.marginResponseReady) break;
+                Sleep(10);
+            }
+            if (G.marginResponseReady) {
+                // Re-read sym to get updated marginPerLot
+                Symbols::GetSymbol(Asset, sym);
+                Log::Info("ASSET", "M7 margin loaded for %s: marginPerLot=%.4f (vol=%lld)", Asset, sym.marginPerLot, marginVolume);
+            } else {
+                Log::Warn("ASSET", "M7 ExpectedMarginReq timeout for %s (3s)", Asset);
+            }
+        } else {
+            Log::Warn("ASSET", "M7 ExpectedMarginReq send failed for %s", Asset);
+        }
+        G.waitingForMargin = false;
+    }
+
     if (pPrice) *pPrice = sym.ask > 0.0 ? sym.ask : sym.bid;
     if (pSpread) *pSpread = (sym.ask > 0.0 && sym.bid > 0.0) ? (sym.ask - sym.bid) : 0.0;
 
@@ -572,38 +675,69 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
     }
 
     if (pLotAmount) {
-        // 1 Zorro Amount unit = 100 cTrader volume units
-        // Must match ZorroToVolume: volume = abs(amount) * 100
-        *pLotAmount = 100.0;
+        // M7: ComputeLotAmount clamps to min 1.0 for CFD indices
+        // Forex(10M)=1000, Gold(10K)=1, Index(100)=1 (clamped)
+        *pLotAmount = ComputeLotAmount(sym.lotSize);
     }
 
     if (pPipCost) {
-        // PipCost = value of 1 pip per 1 Zorro lot (Amount=1) in quote currency
-        // Amount=1 → 100 base currency → 1 pip profit = pip * 100
+        // PIPCost = PIP * LotAmount * QuoteCurrencyToAccountRate
+        // Must be in account currency (USD)
         double pip = 1.0 / pow(10.0, (double)sym.pipPosition);
-        *pPipCost = pip * 100.0;
+        double lotAmount = ComputeLotAmount(sym.lotSize);
+        double price = sym.ask > 0.0 ? sym.ask : sym.bid;
+
+        double quoteToAccountRate = 1.0;
+        if (G.depositAssetId > 0 && sym.quoteAssetId > 0) {
+            if (sym.quoteAssetId == G.depositAssetId) {
+                // Quote = account currency (EUR/USD, XAU/USD, US30 on USD account)
+                quoteToAccountRate = 1.0;
+            } else if (sym.baseAssetId == G.depositAssetId && price > 0.0) {
+                // Base = account currency (USD/JPY, USD/CHF on USD account)
+                quoteToAccountRate = 1.0 / price;
+            } else {
+                // Cross pair (EUR/CHF, UK100/GBP, GER30/EUR)
+                // TODO: SymbolsForConversionReq (2118) for accurate cross rates
+                quoteToAccountRate = 1.0;
+            }
+        }
+
+        *pPipCost = pip * lotAmount * quoteToAccountRate;
     }
 
     if (pMarginCost) {
-        // Negative value = leverage ratio (e.g. -500 means 500:1)
-        // leverageInCents from TraderRes: 50000 = 500:1
-        if (G.leverageInCents > 0) {
-            *pMarginCost = -(double)G.leverageInCents / 100.0;
+        // M7: per-symbol margin from ExpectedMarginRes (positive = direct margin cost per lot)
+        // Zorro support confirmed: return real margin cost, NOT negative leverage
+        // Minimum threshold: 1 cent (0.01) per Zorro support
+        if (sym.marginPerLot > 0.01) {
+            *pMarginCost = sym.marginPerLot;                    // positive = direct margin per lot
+        } else if (G.leverageInCents > 0) {
+            // Fallback: calculate from global leverage using dynamic LotAmount
+            double price = sym.ask > 0.0 ? sym.ask : sym.bid;
+            double lotAmount = ComputeLotAmount(sym.lotSize);
+            if (price > 0.0 && lotAmount > 0.0)
+                *pMarginCost = lotAmount * price / ((double)G.leverageInCents / 100.0);
+            else
+                *pMarginCost = 0.0;
         } else {
-            *pMarginCost = -100.0;  // safe fallback: 100:1
+            *pMarginCost = 0.0;
         }
     }
 
-    if (pRollLong) *pRollLong = sym.swapLong;
-    if (pRollShort) *pRollShort = sym.swapShort;
+    // M7b: Convert swap from cTrader units to Zorro rollover format
+    if (pRollLong) *pRollLong = ConvertSwapToZorro(sym.swapLong, sym);
+    if (pRollShort) *pRollShort = ConvertSwapToZorro(sym.swapShort, sym);
 
     G.currentSymbol = Asset;
 
-    Log::Diag(1, "ASSET %s: lotSize=%lld pip=%d LotAmt=%.1f PipCost=%.5f MCost=%.1f",
-              Asset, sym.lotSize, sym.pipPosition,
+    Log::Info("ASSET", "%s: bid=%.5f ask=%.5f LotAmt=%.1f PipCost=%.6f MCost=%.4f marginPerLot=%.4f swapType=%d rawSwap=%.4f/%.4f Roll=%.4f/%.4f",
+              Asset, sym.bid, sym.ask,
               pLotAmount ? *pLotAmount : -1.0,
               pPipCost ? *pPipCost : -1.0,
-              pMarginCost ? *pMarginCost : 0.0);
+              pMarginCost ? *pMarginCost : 0.0,
+              sym.marginPerLot,
+              sym.swapCalculationType, sym.swapLong, sym.swapShort,
+              pRollLong ? *pRollLong : 0.0, pRollShort ? *pRollShort : 0.0);
 
     return 1;
 }
@@ -1373,10 +1507,11 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             SymbolInfo sym;
             if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
             if (sym.lotSize <= 0) return 0;
-            // LotAmount=100. MinLot = (minVolume/100) / LotAmount = minVolume/10000
-            double minLot = (double)sym.minVolume / 10000.0;
-            Log::Diag(1, "CMD GET_MINLOT %s: minVol=%lld lotSize=%lld -> %.4f",
-                      G.currentSymbol.c_str(), sym.minVolume, sym.lotSize, minLot);
+            // MinLot in Zorro lots: minVolume_cents / (LotAmount * 100)
+            double lotAmount = ComputeLotAmount(sym.lotSize);
+            double minLot = (double)sym.minVolume / (lotAmount * 100.0);
+            Log::Diag(1, "CMD GET_MINLOT %s: minVol=%lld lotSize=%lld lotAmt=%.1f -> %.4f",
+                      G.currentSymbol.c_str(), sym.minVolume, sym.lotSize, lotAmount, minLot);
             return minLot;
         }
 
@@ -1384,14 +1519,16 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             SymbolInfo sym;
             if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
             if (sym.lotSize <= 0) return 0;
-            return (double)sym.stepVolume / 10000.0;
+            double lotAmount = ComputeLotAmount(sym.lotSize);
+            return (double)sym.stepVolume / (lotAmount * 100.0);
         }
 
         case GET_MAXLOT: { // 25
             SymbolInfo sym;
             if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
             if (sym.lotSize <= 0) return 0;
-            return (double)sym.maxVolume / 10000.0;
+            double lotAmount = ComputeLotAmount(sym.lotSize);
+            return (double)sym.maxVolume / (lotAmount * 100.0);
         }
 
         case GET_DIGITS: { // 12 - number of digits after decimal point
@@ -1512,14 +1649,14 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
 
         case GET_TRADES: { // 71 - fill TRADE array with all open positions
             // dwParameter = pointer to ZorroTrade array (Zorro provides buffer)
-            // Returns count of ALL open positions (including reconciled/external)
-            // This enables brokerTrades() to discover orphaned positions after restart
+            // Returns Zorro-opened positions (reconciled=false, has z_N label)
+            // External positions (reconciled=true) excluded: Zorro assigns them to wrong asset
             if (!dwParameter) return 0;
             ZorroTrade* trades = (ZorroTrade*)dwParameter;
             int count = 0;
             CsLock lock(G.csTrades);
             for (auto& kv : G.trades) {
-                if (kv.second.open && kv.second.positionId > 0) {
+                if (kv.second.open && kv.second.positionId > 0 && !kv.second.reconciled) {
                     memset(&trades[count], 0, sizeof(ZorroTrade));
                     trades[count].nID = kv.first;  // zorroId
                     trades[count].nLots = (int)(kv.second.volume / 100LL);
@@ -1535,6 +1672,9 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
 
         case SET_HWND: // 172 - store Zorro's window handle
             return 1;  // acknowledged, not used
+
+        case SET_LEVERAGE: // 140 - cTrader manages leverage server-side, ignore
+            return 0;
 
         case SET_SLIPPAGE: // 129 - max slippage in pips (stored but not enforced by plugin)
             return 1;  // acknowledged, cTrader handles slippage server-side
@@ -1558,15 +1698,15 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             return oleDate;
         }
 
-        case GET_MARGININIT: { // 29 - initial margin per lot
-            // Margin = LotAmount * price / leverage
+        case GET_MARGININIT: { // 29 - initial margin per lot (M7: per-symbol margin)
             SymbolInfo sym;
             if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
+            // Use server margin directly (marginPerLot = margin for LotAmount=100 units)
+            if (sym.marginPerLot > 0.0) return sym.marginPerLot;
+            // Fallback: LotAmount * price / leverage
             double price = sym.ask > 0.0 ? sym.ask : sym.bid;
             if (price <= 0.0 || G.leverageInCents <= 0) return 0;
-            double leverage = (double)G.leverageInCents / 100.0;
-            double lotAmount = 100.0;  // matches BrokerAsset pLotAmount
-            return lotAmount * price / leverage;
+            return 100.0 * price / ((double)G.leverageInCents / 100.0);
         }
 
         case GET_MARGINMAINTAIN: // 30 - maintenance margin (same as init for cTrader)
