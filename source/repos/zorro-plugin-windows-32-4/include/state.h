@@ -200,6 +200,24 @@ struct State {
     volatile bool marginResponseReady = false;
     long long marginPendingSymbolId = 0;      // which symbol we sent ExpectedMarginReq for
 
+    // Currency conversion chains (M9: SymbolsForConversionReq/Res 2118/2119)
+    struct ConvChainEntry {
+        long long symbolId = 0;
+        long long baseAssetId = 0;
+        long long quoteAssetId = 0;
+    };
+    struct ConvInfo {
+        std::vector<ConvChainEntry> chain;  // ordered symbol chain
+        bool loaded = false;                // chain already fetched from server
+    };
+    // quoteAssetId → conversion chain to depositAssetId
+    // Shared across symbols with same quote currency (e.g., all xxxUSD)
+    std::map<long long, ConvInfo> quoteToDepositConv;
+    volatile bool waitingForConversion = false;
+    volatile bool conversionResponseReady = false;
+    static constexpr int CONV_BUF_SIZE = 32 * 1024;  // 32KB
+    char conversionResponseBuf[CONV_BUF_SIZE] = {};
+
     // Subscription tracking
     int quoteCount = 0;
     ULONGLONG subscriptionStartMs = 0;
@@ -228,7 +246,7 @@ extern State G;
 // Constants
 constexpr int PLUGIN_TYPE = 2;
 constexpr const char* PLUGIN_NAME = "cTrader";
-constexpr const char* PLUGIN_VERSION = "4.6.0";
+constexpr const char* PLUGIN_VERSION = "4.7.0";
 constexpr const char* CTRADER_HOST_DEMO = "demo.ctraderapi.com";
 constexpr const char* CTRADER_HOST_LIVE = "live.ctraderapi.com";
 constexpr int CTRADER_WS_PORT = 5036;

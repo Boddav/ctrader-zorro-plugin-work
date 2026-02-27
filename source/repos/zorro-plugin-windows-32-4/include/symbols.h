@@ -27,6 +27,13 @@ void HandleSymbolByIdRes(const char* buffer);
 // Process ExpectedMarginRes (M7: per-symbol margin)
 void HandleExpectedMarginRes(const char* buffer);
 
+// M9: Currency conversion chain (SymbolsForConversionReq/Res 2118/2119)
+// Get quoteToDeposit rate for a symbol. Lazy-loads chain from server on first call.
+double GetQuoteToDepositRate(const SymbolInfo& sym);
+
+// Handle SymbolsForConversionRes from NetworkThread
+void HandleSymbolsForConversionRes(const char* buffer);
+
 // Lookup symbol by name (thread-safe)
 bool GetSymbol(const char* name, SymbolInfo& out);
 

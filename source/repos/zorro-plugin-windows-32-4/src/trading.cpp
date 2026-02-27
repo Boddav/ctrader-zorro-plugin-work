@@ -609,32 +609,66 @@ int SellOrder(int tradeId, int amount, double limit,
                 long long filledVol = Protocol::ExtractInt64(buf, "filledVolume");
                 if (filledVol <= 0) filledVol = closeVol;
 
-                double scale = pow(10.0, (double)G.moneyDigits);
-                double commission = (double)Protocol::ExtractInt64(buf, "commission") / scale;
-                double swap = (double)Protocol::ExtractInt64(buf, "swap") / scale;
-
                 bool fullyClosed = IsPositionClosed(buf);
                 if (!fullyClosed && filledVol >= ti.volume) {
                     fullyClosed = true;
                 }
 
-                // Calculate profit in quote currency, then convert to deposit currency
-                double lotAmount = (double)sym.lotSize / 100.0;
-                double lots = (double)filledVol / (double)sym.lotSize;
-                double priceDiff = (ti.tradeSide == 1)
-                    ? (closePrice - ti.openPrice)
-                    : (ti.openPrice - closePrice);
-                double profit = priceDiff * lots * lotAmount;
+                double profit = 0.0;
+                double commission = 0.0;
+                double swap = 0.0;
+                bool usedServerPnL = false;
 
-                // Cross-currency conversion: quote -> deposit
-                if (G.depositAssetId > 0 && sym.symbolId > 0) {
-                    if (G.depositAssetId == sym.baseAssetId && closePrice > 0.0) {
-                        profit /= closePrice;
+                // Try server-calculated P&L from closePositionDetail
+                // grossProfit is unique to closePositionDetail (no field name conflicts)
+                const char* cpdStart = strstr(buf, "\"closePositionDetail\"");
+                if (cpdStart) {
+                    const char* cpdObj = strchr(cpdStart, '{');
+                    if (cpdObj) {
+                        // Extract from within closePositionDetail sub-object
+                        // to avoid conflicts with deal/position-level swap/commission
+                        int md = Protocol::ExtractInt(cpdObj, "moneyDigits");
+                        double detailScale = (md > 0) ? pow(10.0, (double)md) : pow(10.0, (double)G.moneyDigits);
+
+                        long long grossRaw = Protocol::ExtractInt64(cpdObj, "grossProfit");
+                        long long swapRaw = Protocol::ExtractInt64(cpdObj, "swap");
+                        long long commRaw = Protocol::ExtractInt64(cpdObj, "commission");
+
+                        double grossProfit = (double)grossRaw / detailScale;
+                        swap = (double)swapRaw / detailScale;
+                        commission = (double)commRaw / detailScale;
+
+                        // NET P&L = gross + swap + commission (swap/commission are negative costs)
+                        profit = grossProfit + swap + commission;
+                        usedServerPnL = true;
+
+                        Log::Info("TRADE", "CloseDetail: gross=%.2f swap=%.2f comm=%.2f NET=%.2f (raw g=%lld s=%lld c=%lld scale=%.0f)",
+                                  grossProfit, swap, commission, profit, grossRaw, swapRaw, commRaw, detailScale);
                     }
                 }
 
+                // Fallback: local calculation (if server didn't provide closePositionDetail)
+                if (!usedServerPnL) {
+                    double scale = pow(10.0, (double)G.moneyDigits);
+                    commission = (double)Protocol::ExtractInt64(buf, "commission") / scale;
+                    swap = (double)Protocol::ExtractInt64(buf, "swap") / scale;
+
+                    double lotAmount = (double)sym.lotSize / 100.0;
+                    double lots = (double)filledVol / (double)sym.lotSize;
+                    double priceDiff = (ti.tradeSide == 1)
+                        ? (closePrice - ti.openPrice)
+                        : (ti.openPrice - closePrice);
+                    profit = priceDiff * lots * lotAmount;
+
+                    // Cross-currency conversion: quote -> deposit (M9: full chain)
+                    profit *= Symbols::GetQuoteToDepositRate(sym);
+
+                    // Include costs for NET consistency with server path
+                    profit += ti.swap + ti.commission + swap + commission;
+                }
+
                 if (pClose) *pClose = closePrice;
-                if (pCost) *pCost = ti.swap + ti.commission + commission;
+                if (pCost) *pCost = 0.0;  // costs already in NET profit
                 if (pProfit) *pProfit = profit;
                 if (pFill) *pFill = VolumeToZorro(filledVol, ti.tradeSide);
 
@@ -646,8 +680,14 @@ int SellOrder(int tradeId, int amount, double limit,
                         if (fullyClosed) {
                             it->second.open = false;
                             it->second.profit = profit;
-                            it->second.commission += commission;
-                            it->second.swap += swap;
+                            if (usedServerPnL) {
+                                // Server values are position totals — SET directly
+                                it->second.commission = commission;
+                                it->second.swap = swap;
+                            } else {
+                                it->second.commission += commission;
+                                it->second.swap += swap;
+                            }
                         } else {
                             it->second.volume -= filledVol;
                             it->second.commission += commission;
@@ -656,10 +696,11 @@ int SellOrder(int tradeId, int amount, double limit,
                     }
                 }
 
-                Log::Info("TRADE", "Position %s: tradeId=%d price=%.5f profit=%.2f %s",
+                Log::Info("TRADE", "Position %s: tradeId=%d price=%.5f profit=%.2f %s%s",
                           fullyClosed ? "closed" : "partially closed",
                           lookupId, closePrice, profit,
-                          fullyClosed ? "" : "(still open)");
+                          fullyClosed ? "" : "(still open)",
+                          usedServerPnL ? " [server PnL]" : " [local calc]");
 
                 // BrokerSell2 return: tradeId = success, 0 = failure
                 return lookupId;
@@ -766,12 +807,12 @@ int GetTradeStatus(int tradeId, double* pOpen, double* pClose,
             RefreshUnrealizedPnL();
         }
 
-        // Try server PnL cache
+        // Try server PnL cache — use NET P&L (includes swap+commission) to match cTrader dashboard
         if (ti.positionId > 0 && G.pnlCacheTimeMs > 0) {
             CsLock lock(G.csTrades);
             auto it = G.pnlCache.find(ti.positionId);
             if (it != G.pnlCache.end()) {
-                profit = it->second.gross;
+                profit = it->second.net;
                 usedCache = true;
             }
         }
@@ -783,20 +824,14 @@ int GetTradeStatus(int tradeId, double* pOpen, double* pClose,
                 : (ti.openPrice - closePrice);
             profit = priceDiff * (double)ti.volume / 100.0;
 
-            // Cross-currency conversion: quote -> deposit
-            if (G.depositAssetId > 0 && sym.symbolId > 0) {
-                if (G.depositAssetId == sym.baseAssetId && closePrice > 0.0) {
-                    // Deposit = base currency (e.g. EUR account, EURUSD trade)
-                    // Profit is in quote (USD), divide by close price to get base (EUR)
-                    profit /= closePrice;
-                }
-                // If depositAssetId == quoteAssetId, profit already in deposit currency
-                // If neither matches (cross-pair), profit stays in quote currency (approximate)
-            }
+            // Cross-currency conversion: quote -> deposit (using 2118 chain)
+            profit *= Symbols::GetQuoteToDepositRate(sym);
         }
 
         if (pProfit) *pProfit = profit;
-        if (pCost) *pCost = ti.swap + ti.commission;
+        // When using cache NET, costs are already in profit → pCost = 0
+        // When using fallback gross, costs are separate in pCost
+        if (pCost) *pCost = usedCache ? 0.0 : (ti.swap + ti.commission);
     }
 
     // BrokerTrade return value = nLotAmount, ALWAYS POSITIVE (Zorro convention)
@@ -861,8 +896,33 @@ void HandleExecutionEvent(const char* buffer, int bufLen) {
                     ti.open = false;
                     // executionPrice is a JSON double
                     double closePrice = Protocol::ExtractDouble(buffer, "executionPrice");
-                    Log::Info("TRADE", "Position auto-closed: zorroId=%d posId=%lld at %.5f",
-                              zid, posId, closePrice);
+
+                    // Extract server P&L from closePositionDetail if available
+                    const char* cpdStart = strstr(buffer, "\"closePositionDetail\"");
+                    if (cpdStart) {
+                        const char* cpdObj = strchr(cpdStart, '{');
+                        if (cpdObj) {
+                            int md = Protocol::ExtractInt(cpdObj, "moneyDigits");
+                            double scale = (md > 0) ? pow(10.0, (double)md) : pow(10.0, (double)G.moneyDigits);
+
+                            long long grossRaw = Protocol::ExtractInt64(cpdObj, "grossProfit");
+                            long long swapRaw = Protocol::ExtractInt64(cpdObj, "swap");
+                            long long commRaw = Protocol::ExtractInt64(cpdObj, "commission");
+
+                            ti.commission = (double)commRaw / scale;
+                            ti.swap = (double)swapRaw / scale;
+                            ti.profit = ((double)grossRaw + (double)swapRaw + (double)commRaw) / scale;
+
+                            Log::Info("TRADE", "Position auto-closed: zorroId=%d posId=%lld at %.5f NET=%.2f [server PnL]",
+                                      zid, posId, closePrice, ti.profit);
+                        } else {
+                            Log::Info("TRADE", "Position auto-closed: zorroId=%d posId=%lld at %.5f [no detail]",
+                                      zid, posId, closePrice);
+                        }
+                    } else {
+                        Log::Info("TRADE", "Position auto-closed: zorroId=%d posId=%lld at %.5f [no closePositionDetail]",
+                                  zid, posId, closePrice);
+                    }
                 }
             }
         }

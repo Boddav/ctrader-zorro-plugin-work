@@ -97,6 +97,11 @@ void Reset() {
     G.marginResponseReady = false;
     G.marginPendingSymbolId = 0;
 
+    // Conversion cache (M9)
+    G.quoteToDepositConv.clear();
+    G.waitingForConversion = false;
+    G.conversionResponseReady = false;
+
     // Current state
     G.currentSymbol.clear();
     G.orderType = 0;

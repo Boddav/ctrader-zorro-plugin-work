@@ -52,18 +52,16 @@ static double ConvertSwapToZorro(double swapValue, const SymbolInfo& sym) {
     double lotAmount = ComputeLotAmount(sym.minVolume, sym.lotSize);
     // Forex heuristic: LotAmount >= 100 (lotSize >= 1M cents = 10K+ base units)
     bool isForex = (lotAmount >= 100.0);
+    // M9: Use accurate conversion rate (handles cross-currency pairs like USDJPY on USD account)
+    double qRate = Symbols::GetQuoteToDepositRate(sym);
 
     switch (sym.swapCalculationType) {
     case 0: { // PIPS
         double pip = pow(10.0, -(double)sym.pipPosition);
         if (isForex) {
-            // Zorro: $ per 10,000 base currency units per day
-            // = swapPips × pip × 10000 (× quoteToAccountRate, TODO)
-            return swapValue * pip * 10000.0;
+            return swapValue * pip * 10000.0 * qRate;
         } else {
-            // Zorro: $ per contract (= per LotAmount units) per day
-            // = swapPips × pip × LotAmount (× quoteToAccountRate, TODO)
-            return swapValue * pip * lotAmount;
+            return swapValue * pip * lotAmount * qRate;
         }
     }
     case 1: { // PERCENTAGE (annual)
@@ -72,21 +70,20 @@ static double ConvertSwapToZorro(double swapValue, const SymbolInfo& sym) {
         if (price <= 0.0) return 0.0;
         double dailyFraction = swapValue / 100.0 / 365.0;
         if (isForex) {
-            return dailyFraction * price * 10000.0;
+            return dailyFraction * price * 10000.0 * qRate;
         } else {
-            return dailyFraction * price * lotAmount;
+            return dailyFraction * price * lotAmount * qRate;
         }
     }
     case 2: { // POINTS (uses digits instead of pipPosition)
         double point = pow(10.0, -(double)sym.digits);
         if (isForex) {
-            return swapValue * point * 10000.0;
+            return swapValue * point * 10000.0 * qRate;
         } else {
-            return swapValue * point * lotAmount;
+            return swapValue * point * lotAmount * qRate;
         }
     }
     default:
-        // Unknown type: pass raw value (backwards compatible)
         return swapValue;
     }
 }
@@ -141,9 +138,10 @@ static double ConvertCommissionToZorro(const SymbolInfo& sym) {
         break;
     }
     case 4: { // QUOTE_CCY_PER_LOT
-        // Same as USD_PER_LOT for USD-quoted pairs
-        // For non-USD quote, would need conversion (TODO)
-        roundTripPer10K = 2.0 * commPerSide * 10000.0 / unitsPerLot;
+        // Commission in quote currency per lot per side
+        // M9: Convert to account currency using conversion chain
+        double qRate = Symbols::GetQuoteToDepositRate(sym);
+        roundTripPer10K = 2.0 * commPerSide * qRate * 10000.0 / unitsPerLot;
         break;
     }
     default:
@@ -346,6 +344,10 @@ static unsigned __stdcall NetworkThread(void* param) {
             case ToInt(PayloadType::ExpectedMarginRes):
                 Symbols::HandleExpectedMarginRes(buffer);
                 if (G.waitingForMargin) G.marginResponseReady = true;
+                break;
+
+            case ToInt(PayloadType::SymbolsForConversionRes):
+                Symbols::HandleSymbolsForConversionRes(buffer);
                 break;
 
             case ToInt(PayloadType::ErrorRes):
@@ -766,25 +768,10 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
 
     if (pPipCost) {
         // PIPCost = PIP * LotAmount * QuoteCurrencyToAccountRate
-        // Must be in account currency (USD)
+        // M9: Uses SymbolsForConversionReq (2118) for cross-currency pairs
         double pip = 1.0 / pow(10.0, (double)sym.pipPosition);
         double lotAmount = ComputeLotAmount(sym.minVolume, sym.lotSize);
-        double price = sym.ask > 0.0 ? sym.ask : sym.bid;
-
-        double quoteToAccountRate = 1.0;
-        if (G.depositAssetId > 0 && sym.quoteAssetId > 0) {
-            if (sym.quoteAssetId == G.depositAssetId) {
-                // Quote = account currency (EUR/USD, XAU/USD, US30 on USD account)
-                quoteToAccountRate = 1.0;
-            } else if (sym.baseAssetId == G.depositAssetId && price > 0.0) {
-                // Base = account currency (USD/JPY, USD/CHF on USD account)
-                quoteToAccountRate = 1.0 / price;
-            } else {
-                // Cross pair (EUR/CHF, UK100/GBP, GER30/EUR)
-                // TODO: SymbolsForConversionReq (2118) for accurate cross rates
-                quoteToAccountRate = 1.0;
-            }
-        }
+        double quoteToAccountRate = Symbols::GetQuoteToDepositRate(sym);
 
         *pPipCost = pip * lotAmount * quoteToAccountRate;
     }
@@ -846,7 +833,7 @@ DLLFUNC int BrokerAccount(char* Account, double* pBalance, double* pTradeVal,
                 if (!kv.second.open || kv.second.positionId <= 0) continue;
                 auto pnlIt = G.pnlCache.find(kv.second.positionId);
                 if (pnlIt != G.pnlCache.end()) {
-                    totalPnL += pnlIt->second.gross;
+                    totalPnL += pnlIt->second.net;
                     usedCache = true;
                 }
             }
@@ -866,12 +853,8 @@ DLLFUNC int BrokerAccount(char* Account, double* pBalance, double* pTradeVal,
                     ? (closePrice - ti.openPrice)
                     : (ti.openPrice - closePrice);
                 double profit = priceDiff * (double)ti.volume / 100.0;
-                // Cross-currency conversion
-                if (G.depositAssetId > 0 && sym.symbolId > 0) {
-                    if (G.depositAssetId == sym.baseAssetId && closePrice > 0.0)
-                        profit /= closePrice;
-                    // If depositAssetId == quoteAssetId, profit already in deposit currency
-                }
+                // Cross-currency conversion (using 2118 chain)
+                profit *= Symbols::GetQuoteToDepositRate(sym);
                 totalPnL += profit;
             }
         }

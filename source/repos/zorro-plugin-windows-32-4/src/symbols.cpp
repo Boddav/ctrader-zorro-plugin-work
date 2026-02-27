@@ -381,4 +381,179 @@ const char* GetNameById(long long symbolId) {
     return name;
 }
 
+// ============================================================
+// M9: Currency Conversion Chain (SymbolsForConversionReq/Res 2118/2119)
+// ============================================================
+
+// Request conversion chain from server (synchronous, like ExpectedMarginReq)
+static bool RequestConversionChain(long long firstAssetId, long long lastAssetId) {
+    char payload[256];
+    sprintf_s(payload, "\"ctidTraderAccountId\":%lld,\"firstAssetId\":%lld,\"lastAssetId\":%lld",
+              G.accountId, firstAssetId, lastAssetId);
+
+    const char* msg = Protocol::BuildMessage(Utils::NextMsgId(),
+                                             PayloadType::SymbolsForConversionReq, payload);
+
+    G.conversionResponseReady = false;
+    G.waitingForConversion = true;
+
+    if (!WebSocket::Send(msg)) {
+        G.waitingForConversion = false;
+        Log::Warn("CONV", "SymbolsForConversionReq send failed (first=%lld last=%lld)", firstAssetId, lastAssetId);
+        return false;
+    }
+
+    // Spin-wait for NetworkThread (max 5s)
+    ULONGLONG start = GetTickCount64();
+    while (GetTickCount64() - start < 5000) {
+        if (G.conversionResponseReady) {
+            G.waitingForConversion = false;
+            return true;
+        }
+        Sleep(10);
+        if (BrokerProgress) BrokerProgress(1);
+    }
+
+    G.waitingForConversion = false;
+    Log::Warn("CONV", "SymbolsForConversionReq timeout (first=%lld last=%lld)", firstAssetId, lastAssetId);
+    return false;
+}
+
+void HandleSymbolsForConversionRes(const char* buffer) {
+    // Parse the conversion chain into the pending quoteAssetId's ConvInfo
+    // This is called from NetworkThread context — just copy to buffer and signal
+
+    // Copy response to shared buffer
+    int len = (int)strlen(buffer);
+    int copyLen = (len < State::CONV_BUF_SIZE - 1) ? len : State::CONV_BUF_SIZE - 1;
+    memcpy(G.conversionResponseBuf, buffer, copyLen);
+    G.conversionResponseBuf[copyLen] = '\0';
+    G.conversionResponseReady = true;
+}
+
+// Parse the conversion response buffer and store chain
+static void ParseConversionResponse(long long quoteAssetId) {
+    const char* arr = Protocol::ExtractArray(G.conversionResponseBuf, "symbol");
+    if (!arr || *arr == '\0') {
+        // Empty chain = same currency (rate = 1.0)
+        G.quoteToDepositConv[quoteAssetId].loaded = true;
+        Log::Info("CONV", "Empty chain for quoteAssetId=%lld (same as deposit?)", quoteAssetId);
+        return;
+    }
+
+    int count = Protocol::CountArrayElements(arr);
+    auto& info = G.quoteToDepositConv[quoteAssetId];
+    info.chain.clear();
+
+    // Collect chain entries and symbols to subscribe
+    std::vector<std::string> toSubscribe;
+
+    for (int i = 0; i < count; i++) {
+        const char* elem = Protocol::GetArrayElement(arr, i);
+        if (!elem) continue;
+
+        State::ConvChainEntry entry;
+        entry.symbolId = Protocol::ExtractInt64(elem, "symbolId");
+        entry.baseAssetId = Protocol::ExtractInt64(elem, "baseAssetId");
+        entry.quoteAssetId = Protocol::ExtractInt64(elem, "quoteAssetId");
+        info.chain.push_back(entry);
+
+        const char* symName = Protocol::ExtractString(elem, "symbolName");
+        Log::Info("CONV", "Chain[%d]: %s (id=%lld base=%lld quote=%lld)",
+                  i, symName ? symName : "?", entry.symbolId, entry.baseAssetId, entry.quoteAssetId);
+
+        // Check if chain symbol needs subscribing
+        if (entry.symbolId > 0) {
+            CsLock lock(G.csSymbols);
+            auto it = G.symbolIdToName.find(entry.symbolId);
+            if (it != G.symbolIdToName.end()) {
+                auto sit = G.symbols.find(it->second);
+                if (sit != G.symbols.end() && !sit->second.subscribed) {
+                    toSubscribe.push_back(it->second);
+                }
+            }
+        }
+    }
+
+    info.loaded = true;
+    Log::Info("CONV", "Loaded %d-symbol chain for quoteAssetId=%lld", count, quoteAssetId);
+
+    // Subscribe chain symbols AFTER parsing (no lock held)
+    for (const auto& name : toSubscribe) {
+        Subscribe(name.c_str());
+    }
+}
+
+// Compute conversion rate by traversing the chain with current bid prices
+static double ComputeRateFromChain(long long quoteAssetId) {
+    auto it = G.quoteToDepositConv.find(quoteAssetId);
+    if (it == G.quoteToDepositConv.end() || !it->second.loaded) return 1.0;
+
+    const auto& chain = it->second.chain;
+    if (chain.empty()) return 1.0;  // same currency
+
+    double rate = 1.0;
+    long long currentAssetId = quoteAssetId;
+
+    for (const auto& entry : chain) {
+        // Find bid price for this chain symbol
+        double bid = 0.0;
+        {
+            CsLock lock(G.csSymbols);
+            auto sit = G.symbolIdToName.find(entry.symbolId);
+            if (sit != G.symbolIdToName.end()) {
+                auto symIt = G.symbols.find(sit->second);
+                if (symIt != G.symbols.end()) {
+                    bid = symIt->second.bid;
+                }
+            }
+        }
+
+        if (bid <= 0.0) {
+            Log::Warn("CONV", "No bid for chain symbol id=%lld, rate=1.0", entry.symbolId);
+            return 1.0;  // can't compute without price
+        }
+
+        if (entry.baseAssetId == currentAssetId) {
+            // We have base, want quote → multiply
+            rate *= bid;
+            currentAssetId = entry.quoteAssetId;
+        } else {
+            // We have quote, want base → divide
+            rate /= bid;
+            currentAssetId = entry.baseAssetId;
+        }
+    }
+
+    return rate;
+}
+
+double GetQuoteToDepositRate(const SymbolInfo& sym) {
+    if (G.depositAssetId <= 0 || sym.quoteAssetId <= 0) return 1.0;
+
+    // Case 1: Quote = deposit currency (EUR/USD on USD account)
+    if (sym.quoteAssetId == G.depositAssetId) return 1.0;
+
+    // Case 2: Base = deposit currency (USD/JPY on USD account)
+    if (sym.baseAssetId == G.depositAssetId) {
+        double price = sym.bid > 0.0 ? sym.bid : sym.ask;
+        return (price > 0.0) ? (1.0 / price) : 1.0;
+    }
+
+    // Case 3: Cross pair — need conversion chain
+    auto it = G.quoteToDepositConv.find(sym.quoteAssetId);
+    if (it == G.quoteToDepositConv.end() || !it->second.loaded) {
+        // Lazy load: request chain from server
+        if (RequestConversionChain(sym.quoteAssetId, G.depositAssetId)) {
+            ParseConversionResponse(sym.quoteAssetId);
+        } else {
+            // Mark as loaded with empty chain to avoid retrying
+            G.quoteToDepositConv[sym.quoteAssetId].loaded = true;
+            return 1.0;
+        }
+    }
+
+    return ComputeRateFromChain(sym.quoteAssetId);
+}
+
 } // namespace Symbols
