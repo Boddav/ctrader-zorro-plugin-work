@@ -251,8 +251,6 @@ static unsigned __stdcall NetworkThread(void* param) {
 
         // Periodic alive log (every 60s)
         if (now - lastAliveLog > 60000) {
-            Log::Info("NET", "NetworkThread alive: wsConn=%d quotes=%d loggedIn=%d",
-                      (int)G.wsConnected, G.quoteCount, (int)G.loggedIn);
             lastAliveLog = now;
         }
 
@@ -499,7 +497,7 @@ DLLFUNC int BrokerLogin(char* User, char* Pwd, char* Type, char* Accounts) {
         // If already connected and logged in, just confirm — don't tear down!
         // Zorro calls BrokerLogin when transitioning from lookback to live trading.
         if (G.loggedIn && WebSocket::IsConnected()) {
-            Log::Info("BROKER", "BrokerLogin: already connected (quotes=%d), returning 1", G.quoteCount);
+            Log::Diag(1, "BROKER BrokerLogin: already connected (quotes=%d), returning 1", G.quoteCount);
             if (Accounts) {
                 sprintf_s(Accounts, 1024, "%lld", G.accountId);
             }
@@ -736,7 +734,7 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
             if (G.marginResponseReady) {
                 // Re-read sym to get updated marginPerLot
                 Symbols::GetSymbol(Asset, sym);
-                Log::Info("ASSET", "M7 margin loaded for %s: marginPerLot=%.4f (vol=%lld)", Asset, sym.marginPerLot, marginVolume);
+                Log::Diag(1, "ASSET M7 margin loaded for %s: marginPerLot=%.4f (vol=%lld)", Asset, sym.marginPerLot, marginVolume);
             } else {
                 Log::Warn("ASSET", "M7 ExpectedMarginReq timeout for %s (3s)", Asset);
             }
@@ -801,15 +799,13 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
 
     G.currentSymbol = Asset;
 
-    Log::Info("ASSET", "%s: bid=%.5f ask=%.5f LotAmt=%.1f PipCost=%.6f MCost=%.4f marginPerLot=%.4f swapType=%d rawSwap=%.4f/%.4f Roll=%.4f/%.4f Comm=%.4f(raw=%lld type=%d)",
+    Log::Diag(2, "ASSET %s: bid=%.5f ask=%.5f LotAmt=%.1f PipCost=%.6f MCost=%.4f Roll=%.4f/%.4f Comm=%.4f",
               Asset, sym.bid, sym.ask,
               pLotAmount ? *pLotAmount : -1.0,
               pPipCost ? *pPipCost : -1.0,
               pMarginCost ? *pMarginCost : 0.0,
-              sym.marginPerLot,
-              sym.swapCalculationType, sym.swapLong, sym.swapShort,
               pRollLong ? *pRollLong : 0.0, pRollShort ? *pRollShort : 0.0,
-              pVolume ? *pVolume : 0.0, sym.commissionRaw, sym.commissionType);
+              pVolume ? *pVolume : 0.0);
 
     return 1;
 }
@@ -883,55 +879,29 @@ DLLFUNC int BrokerAccount(char* Account, double* pBalance, double* pTradeVal,
 
 // Non-extended BrokerBuy: fallback for Zorro compatibility
 DLLFUNC int BrokerBuy(char* Asset, int Amount, double StopDist, double* pPrice) {
-    Log::Info("BROKER", "BrokerBuy ENTER: Asset=%s Amount=%d StopDist=%.5f",
-              Asset ? Asset : "NULL", Amount, StopDist);
-    int result = Trading::BuyOrder(Asset, Amount, StopDist, 0.0, pPrice, NULL);
-    Log::Info("BROKER", "BrokerBuy RETURN: %d pPrice=%.5f",
-              result, pPrice ? *pPrice : 0.0);
-    return result;
+    return Trading::BuyOrder(Asset, Amount, StopDist, 0.0, pPrice, NULL);
 }
 
 DLLFUNC int BrokerBuy2(char* Asset, int Amount, double StopDist, double Limit,
                        double* pPrice, int* pFill) {
-    Log::Info("BROKER", "BrokerBuy2 ENTER: Asset=%s Amount=%d StopDist=%.5f Limit=%.5f pPrice=%p pFill=%p",
-              Asset ? Asset : "NULL", Amount, StopDist, Limit, pPrice, pFill);
-    int result = Trading::BuyOrder(Asset, Amount, StopDist, Limit, pPrice, pFill);
-    Log::Info("BROKER", "BrokerBuy2 RETURN: %d pPrice=%.5f pFill=%d",
-              result, pPrice ? *pPrice : 0.0, pFill ? *pFill : -999);
-    return result;
+    return Trading::BuyOrder(Asset, Amount, StopDist, Limit, pPrice, pFill);
 }
 
 // Non-extended BrokerSell: Zorro may call this during script stop/exit
 // even with PLUGIN_TYPE=2. Without this export, Zorro gets "function not found"
 // and logs "can't close" before falling back to BrokerSell2.
 DLLFUNC int BrokerSell(int TradeID, int Amount) {
-    Log::Info("BROKER", "BrokerSell ENTER: TradeID=%d Amount=%d", TradeID, Amount);
-    int result = Trading::SellOrder(TradeID, Amount, 0.0, NULL, NULL, NULL, NULL);
-    Log::Info("BROKER", "BrokerSell RETURN: %d", result);
-    return result;
+    return Trading::SellOrder(TradeID, Amount, 0.0, NULL, NULL, NULL, NULL);
 }
 
 DLLFUNC int BrokerSell2(int TradeID, int Amount, double Limit,
                         double* pClose, double* pCost, double* pProfit, int* pFill) {
-    Log::Info("BROKER", "BrokerSell2 ENTER: TradeID=%d Amount=%d Limit=%.5f", TradeID, Amount, Limit);
-    int result = Trading::SellOrder(TradeID, Amount, Limit, pClose, pCost, pProfit, pFill);
-    Log::Info("BROKER", "BrokerSell2 RETURN: %d pClose=%.5f pProfit=%.2f pFill=%d",
-              result, pClose ? *pClose : 0.0, pProfit ? *pProfit : 0.0, pFill ? *pFill : -999);
-    return result;
+    return Trading::SellOrder(TradeID, Amount, Limit, pClose, pCost, pProfit, pFill);
 }
 
 DLLFUNC int BrokerTrade(int TradeID, double* pOpen, double* pClose,
                         double* pCost, double* pProfit) {
-    int result = Trading::GetTradeStatus(TradeID, pOpen, pClose, pCost, pProfit);
-    if (result > 0) {
-        Log::Info("BROKER", "BrokerTrade: ID=%d result=%d Open=%.5f Close=%.5f Profit=%.2f",
-                  TradeID, result, pOpen ? *pOpen : 0.0, pClose ? *pClose : 0.0, pProfit ? *pProfit : 0.0);
-    } else if (result == -1) {
-        Log::Info("BROKER", "BrokerTrade: ID=%d CLOSED (result=-1)", TradeID);
-    } else {
-        Log::Warn("BROKER", "BrokerTrade: ID=%d result=%d (unexpected)", TradeID, result);
-    }
-    return result;
+    return Trading::GetTradeStatus(TradeID, pOpen, pClose, pCost, pProfit);
 }
 
 // Map nTickMinutes to cTrader TrendbarPeriod
@@ -1023,11 +993,6 @@ static int ReadHistoryCache(const char* asset, DATE tStart, DATE tEnd,
     }
 
     free(fileBars);
-
-    if (count > 0) {
-        Log::Info("HIST", "Cache HIT: %s %d bars from %s (file has %d total)",
-                  asset, count, path, nRead);
-    }
     return count;
 }
 
@@ -1082,33 +1047,24 @@ static void WriteHistoryCache(const char* asset, T6* bars, int count) {
         if (newestNew >= newestExisting) {
             // New data is newer — write new first, then append older existing bars
             fwrite(bars, sizeof(T6), count, f);
-            int appended = 0;
             for (int i = 0; i < existingCount; i++) {
                 if (existingBars[i].time < oldestNew) {
                     fwrite(&existingBars[i], sizeof(T6), 1, f);
-                    appended++;
                 }
             }
-            Log::Info("HIST", "Cache MERGED: %s new=%d + %d older existing -> %s",
-                      asset, count, appended, path);
         } else {
             // Existing data is newer — write existing first, then append older new bars
             fwrite(existingBars, sizeof(T6), existingCount, f);
-            int appended = 0;
             for (int i = 0; i < count; i++) {
                 if (bars[i].time < oldestExisting) {
                     fwrite(&bars[i], sizeof(T6), 1, f);
-                    appended++;
                 }
             }
-            Log::Info("HIST", "Cache MERGED: %s existing=%d + %d older new -> %s",
-                      asset, existingCount, appended, path);
         }
         free(existingBars);
     } else {
         // No existing file - write new data
         fwrite(bars, sizeof(T6), count, f);
-        Log::Info("HIST", "Cache WROTE: %s %d bars -> %s", asset, count, path);
     }
 
     fclose(f);
@@ -1151,9 +1107,6 @@ static int FetchRawTicks(SymbolInfo& sym, long long startMs, long long endMs,
         const char* msg = Protocol::BuildMessage(Utils::NextMsgId(),
                                                  PayloadType::GetTickDataReq, payload);
 
-        Log::Info("HIST", "RawTicks(type=%d) request: sym=%s from=%lld to=%lld",
-                  tickType, sym.name.c_str(), chunkStart, chunkEnd);
-
         {
             CsLock lock(G.csHistory);
             G.historyResponseReady = false;
@@ -1193,12 +1146,10 @@ static int FetchRawTicks(SymbolInfo& sym, long long startMs, long long endMs,
         // Parse tickData array
         const char* arr = Protocol::ExtractArray(G.historyResponseBuf, "tickData");
         if (!arr || *arr == '\0' || (*arr == '[' && *(arr + 1) == ']')) {
-            Log::Info("HIST", "RawTicks(type=%d) empty response", tickType);
             break;
         }
 
         int count = Protocol::CountArrayElements(arr);
-        Log::Info("HIST", "RawTicks(type=%d) chunk: %d ticks", tickType, count);
 
         // Delta decode ticks
         // Server returns ticks newest-first: first tick is absolute (newest),
@@ -1245,15 +1196,11 @@ static int FetchRawTicks(SymbolInfo& sym, long long startMs, long long endMs,
         if (hasMore && totalTicks < maxTicks && lastTimestamp > 0) {
             // Oldest tick timestamp - 1ms for next page
             chunkEnd = lastTimestamp - 1;
-            Log::Info("HIST", "RawTicks(type=%d) hasMore, next chunkEnd=%lld (total=%d)",
-                      tickType, chunkEnd, totalTicks);
         } else {
             break;
         }
     }
 
-    Log::Info("HIST", "RawTicks(type=%d) %s returned %d ticks",
-              tickType, sym.name.c_str(), totalTicks);
     return totalTicks;
 }
 
@@ -1316,7 +1263,7 @@ static int FetchTickData(SymbolInfo& sym, long long startMs, long long endMs,
         int nAsk = FetchRawTicks(sym, startMs, endMs, nTicks, 2, askRaw);
 
         if (nAsk > 0) {
-            Log::Info("HIST", "ASK ticks fetched: %d (BID: %d)", nAsk, nBid);
+            // spread merge
             // Step 3: Merge spread into BID bars
             MergeSpread(bars, nBid, askRaw, nAsk);
         }
@@ -1324,18 +1271,12 @@ static int FetchTickData(SymbolInfo& sym, long long startMs, long long endMs,
         free(askRaw);
     }
 
-    Log::Info("HIST", "TickData %s returned %d ticks (with spread)", sym.name.c_str(), nBid);
     return nBid;
 }
 
 DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
                            int nTickMinutes, int nTicks, void* ticks) {
-    Log::Info("HIST", ">>> BrokerHistory2 ENTRY: Asset=%s nTickMin=%d nTicks=%d ticks=%p loggedIn=%d",
-              Asset ? Asset : "NULL", nTickMinutes, nTicks, ticks, (int)G.loggedIn);
-
     if (!Asset || !ticks || !G.loggedIn || nTicks <= 0) {
-        Log::Info("HIST", "<<< BrokerHistory2 EARLY EXIT 0 (Asset=%p ticks=%p loggedIn=%d nTicks=%d)",
-                  (void*)Asset, ticks, (int)G.loggedIn, nTicks);
         return 0;
     }
 
@@ -1354,12 +1295,8 @@ DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
 
             // Accept cache if: filled the buffer (nTicks) OR covers >= 80% of requested span
             if (cached >= nTicks || coveragePct >= 80.0) {
-                Log::Info("HIST", "<<< BrokerHistory2 from cache: %s returned %d bars (coverage %.1f%%)",
-                          Asset, cached, coveragePct);
                 return cached;
             }
-            Log::Info("HIST", "Cache INSUFFICIENT: %s has %d bars covering %.1f%% of requested span (need 80%%), fetching from API",
-                      Asset, cached, coveragePct);
             // Fall through to API download
         }
     }
@@ -1377,15 +1314,10 @@ DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
 
     // Tick data: use GetTickData API
     if (nTickMinutes == 0) {
-        Log::Info("HIST", "TickData request: %s from=%lld to=%lld nTicks=%d",
-                  sym.name.c_str(), startMs, endMs, nTicks);
         return FetchTickData(sym, startMs, endMs, nTicks, (T6*)ticks);
     }
 
     int period = MinutesToPeriod(nTickMinutes);
-
-    Log::Info("HIST", "Request: %s (id=%lld) period=%d(%dmin) from=%lld to=%lld nTicks=%d",
-              sym.name.c_str(), sym.symbolId, period, nTickMinutes, startMs, endMs, nTicks);
 
     T6* bars = (T6*)ticks;
     int totalBars = 0;
@@ -1424,8 +1356,6 @@ DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
 
         const char* msg = Protocol::BuildMessage(Utils::NextMsgId(),
                                                  PayloadType::GetTrendbarsReq, payload);
-
-        Log::Info("HIST", "Chunk: from=%lld to=%lld count=%d", chunkStart, chunkEnd, barsNeeded);
 
         // Reset shared buffer and set waiting flag (all inside lock for C6 fix)
         {
@@ -1466,20 +1396,14 @@ DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
             break;
         }
 
-        // Log raw response size
-        int respLen = (int)strlen(G.historyResponseBuf);
-        Log::Info("HIST", "Response: %d bytes", respLen);
-
         // Parse trendbar array
         const char* arr = Protocol::ExtractArray(G.historyResponseBuf, "trendbar");
         if (!arr || *arr == '\0' || (*arr == '[' && *(arr + 1) == ']')) {
-            Log::Info("HIST", "Empty chunk, moving to earlier period");
             chunkEnd = chunkStart;
             continue;
         }
 
         int count = Protocol::CountArrayElements(arr);
-        Log::Info("HIST", "Chunk has %d bars", count);
 
         // Parse all bars from chunk (server returns oldest first)
         std::vector<T6> chunkBars;
@@ -1524,17 +1448,10 @@ DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
             chunkBars.push_back(bar);
         }
 
-        if (!chunkBars.empty()) {
-            Log::Info("HIST", "Bars: oldest=%.6f newest=%.6f",
-                      chunkBars.front().time, chunkBars.back().time);
-        }
-
         // Insert chunk bars in REVERSE order (newest first for Zorro)
         for (int i = (int)chunkBars.size() - 1; i >= 0 && totalBars < nTicks; i--) {
             bars[totalBars++] = chunkBars[i];
         }
-
-        Log::Info("HIST", "Chunk done: %d bars added (total=%d)", count, totalBars);
 
         // Move to earlier period: use oldest bar's timestamp as new chunkEnd
         long long prevChunkEnd = chunkEnd;
@@ -1551,8 +1468,6 @@ DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
         }
     }
 
-    Log::Info("HIST", "<<< BrokerHistory2 EXIT: %s returned %d bars", Asset, totalBars);
-
     // Write bars to History folder for local cache
     if (totalBars > 0) {
         WriteHistoryCache(Asset, bars, totalBars);
@@ -1564,7 +1479,6 @@ DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
 // Legacy BrokerHistory wrapper - Zorro may call this instead of BrokerHistory2
 DLLFUNC int BrokerHistory(char* Asset, DATE tStart, DATE tEnd,
                           int nTickMinutes, int nTicks, void* ticks) {
-    Log::Info("HIST", ">>> BrokerHistory (OLD API) called - forwarding to BrokerHistory2");
     return BrokerHistory2(Asset, tStart, tEnd, nTickMinutes, nTicks, ticks);
 }
 
@@ -1684,8 +1598,6 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             }
             // Cache avg entry for GET_AVGENTRY
             G.lastPositionAvgEntry = (totalVol > 0) ? (totalEntry / (double)totalVol) : 0.0;
-            Log::Info("CMD", "GET_POSITION(%s -> %s) = %lld (avgEntry=%.5f, reconciled excluded)",
-                      posSym, resolvedSym.c_str(), netAmount, G.lastPositionAvgEntry);
             return (double)netAmount;
         }
 
@@ -1763,7 +1675,6 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
                     count++;
                 }
             }
-            Log::Info("CMD", "GET_TRADES: %d open positions returned (sizeof ZorroTrade=%d)", count, (int)sizeof(ZorroTrade));
             return (double)count;
         }
 

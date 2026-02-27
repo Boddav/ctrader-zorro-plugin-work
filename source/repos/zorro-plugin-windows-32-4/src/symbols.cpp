@@ -181,11 +181,6 @@ void HandleSymbolByIdRes(const char* buffer) {
         if (sym.minVolume <= 0) sym.minVolume = 1000;
         if (sym.stepVolume <= 0) sym.stepVolume = 1000;
 
-        Log::Info("SYM", "DETAIL %s: lotSize=%lld minVol=%lld maxVol=%lld stepVol=%lld pipPos=%d digits=%d base=%lld quote=%lld swapL=%.4f swapS=%.4f swapType=%d comm=%lld commType=%d",
-                  it->second.c_str(), sym.lotSize, sym.minVolume, sym.maxVolume, sym.stepVolume,
-                  sym.pipPosition, sym.digits, sym.baseAssetId, sym.quoteAssetId,
-                  sym.swapLong, sym.swapShort, sym.swapCalculationType,
-                  sym.commissionRaw, sym.commissionType);
     }
 
     Log::Info("SYM", "Updated details for %d symbols", count);
@@ -217,7 +212,7 @@ bool Subscribe(const char* symbolName) {
                                              PayloadType::SubscribeSpotsReq, payload);
     if (!WebSocket::Send(msg)) return false;
 
-    Log::Info("SYM", "Subscribe sent for %s (id=%lld)", symbolName, symbolId);
+    Log::Diag(1, "SYM Subscribe sent for %s (id=%lld)", symbolName, symbolId);
 
     // Don't wait for response - NetworkThread will handle SubscribeSpotsRes
     // Give server a moment to start sending quotes
@@ -350,8 +345,8 @@ void HandleExpectedMarginRes(const char* buffer) {
             auto sit = G.symbols.find(it->second);
             if (sit != G.symbols.end()) {
                 sit->second.marginPerLot = margin;
-                Log::Info("SYM", "MARGIN %s: buy=%.4f sell=%.4f -> marginPerLot=%.4f (raw buy=%lld sell=%lld moneyDigits=%d)",
-                          it->second.c_str(), buyMargin, sellMargin, margin, rawBuy, rawSell, G.moneyDigits);
+                Log::Diag(1, "SYM MARGIN %s: buy=%.4f sell=%.4f -> marginPerLot=%.4f",
+                          it->second.c_str(), buyMargin, sellMargin, margin);
             }
         } else {
             Log::Warn("SYM", "ExpectedMarginRes: symbolId=%lld not found in map", symbolId);
@@ -459,7 +454,7 @@ static void ParseConversionResponse(long long quoteAssetId) {
         info.chain.push_back(entry);
 
         const char* symName = Protocol::ExtractString(elem, "symbolName");
-        Log::Info("CONV", "Chain[%d]: %s (id=%lld base=%lld quote=%lld)",
+        Log::Diag(1, "CONV Chain[%d]: %s (id=%lld base=%lld quote=%lld)",
                   i, symName ? symName : "?", entry.symbolId, entry.baseAssetId, entry.quoteAssetId);
 
         // Check if chain symbol needs subscribing

@@ -362,7 +362,7 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
                 // ACCEPTED
                 if (cTraderOrderType == 1) {
                     // Market order: server sends ACCEPTED before FILLED, skip and wait
-                    Log::Info("TRADE", "Market order accepted (event %d), waiting for fill... zorroId=%d",
+                    Log::Diag(1, "TRADE Market order accepted (event %d), waiting for fill... zorroId=%d",
                               eventCount, zorroId);
                     ResetTradingBuffer();
                     // waitingForTrading stays true — NetworkThread keeps forwarding
@@ -411,7 +411,7 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
                 // Other execution types (4=ORDER_REPLACED, 5=ORDER_CANCELLED, etc.)
                 // For market orders: skip and keep waiting for FILLED
                 if (cTraderOrderType == 1) {
-                    Log::Info("TRADE", "Market order event execType=%d (event %d), skipping...", execType, eventCount);
+                    Log::Diag(1, "TRADE Market order event execType=%d (event %d), skipping...", execType, eventCount);
                     ResetTradingBuffer();
                     continue;
                 }
@@ -425,7 +425,7 @@ int BuyOrder(const char* asset, int amount, double stopDist, double limit,
 
         // Unknown payloadType — for market orders, skip and keep waiting
         if (cTraderOrderType == 1) {
-            Log::Info("TRADE", "Market order: skipping unexpected pt=%d (event %d)", pt, eventCount);
+            Log::Diag(1, "TRADE Market order: skipping unexpected pt=%d (event %d)", pt, eventCount);
             ResetTradingBuffer();
             continue;
         }
@@ -477,7 +477,7 @@ int SellOrder(int tradeId, int amount, double limit,
                 it = G.trades.find(aliasIt->second);
                 if (it != G.trades.end()) {
                     lookupId = aliasIt->second;
-                    Log::Info("TRADE", "SellOrder: tradeId=%d resolved via alias to zorroId=%d",
+                    Log::Diag(1, "TRADE SellOrder: tradeId=%d resolved via alias to zorroId=%d",
                               tradeId, lookupId);
                 }
             }
@@ -498,7 +498,7 @@ int SellOrder(int tradeId, int amount, double limit,
                 it = G.trades.find(matchId);
                 lookupId = matchId;
                 G.tradeIdAlias[abs(tradeId)] = matchId;
-                Log::Info("TRADE", "SellOrder: tradeId=%d not found, fallback to zorroId=%d (%s)",
+                Log::Diag(1, "TRADE SellOrder: tradeId=%d not found, fallback to zorroId=%d (%s)",
                           tradeId, lookupId, G.currentSymbol.c_str());
             } else if (matchCount > 1) {
                 Log::Warn("TRADE", "SellOrder: tradeId=%d not found, %d open trades for %s — ambiguous",
@@ -708,20 +708,20 @@ int SellOrder(int tradeId, int amount, double limit,
             else if (execType == 2 || execType == 4 || execType == 5) {
                 // ACCEPTED / ORDER_REPLACED / ORDER_CANCELLED
                 // Close operation gets ACCEPTED before FILLED, skip and wait
-                Log::Info("TRADE", "ClosePosition event execType=%d (event %d), waiting for fill...", execType, eventCount);
+                Log::Diag(1, "TRADE ClosePosition event execType=%d (event %d), waiting...", execType, eventCount);
                 ResetTradingBuffer();
                 continue;
             }
             else {
                 // Other execution types — skip and keep waiting
-                Log::Info("TRADE", "ClosePosition event execType=%d (event %d), skipping...", execType, eventCount);
+                Log::Diag(1, "TRADE ClosePosition event execType=%d (event %d), skipping...", execType, eventCount);
                 ResetTradingBuffer();
                 continue;
             }
         }
 
         // Unknown payloadType — skip and keep waiting
-        Log::Info("TRADE", "ClosePosition: skipping unexpected pt=%d (event %d)", pt, eventCount);
+        Log::Diag(1, "TRADE ClosePosition: skipping unexpected pt=%d (event %d)", pt, eventCount);
         ResetTradingBuffer();
         continue;
     }
@@ -769,7 +769,7 @@ int GetTradeStatus(int tradeId, double* pOpen, double* pClose,
                 it = G.trades.find(matchId);
                 lookupId = matchId;
                 G.tradeIdAlias[abs(tradeId)] = matchId;  // cache the alias
-                Log::Info("TRADE", "GetTradeStatus: tradeId=%d not found, fallback to zorroId=%d (%s)",
+                Log::Diag(1, "TRADE GetTradeStatus: tradeId=%d fallback to zorroId=%d (%s)",
                           tradeId, lookupId, G.currentSymbol.c_str());
             }
         }
@@ -782,7 +782,7 @@ int GetTradeStatus(int tradeId, double* pOpen, double* pClose,
     }
 
     if (!ti.open) {
-        Log::Info("TRADE", "GetTradeStatus: tradeId=%d is closed -> return -1", tradeId);
+        Log::Diag(1, "TRADE GetTradeStatus: tradeId=%d is closed -> return -1", tradeId);
         return -1;  // trade closed = Zorro books P&L
     }
 
@@ -871,7 +871,7 @@ void HandleExecutionEvent(const char* buffer, int bufLen) {
     long long posId = Protocol::ExtractInt64(buffer, "positionId");
     int posStatusInt = Protocol::ExtractInt(buffer, "positionStatus");
 
-    Log::Info("TRADE", "Async ExecutionEvent: execType=%d posId=%lld status=%d",
+    Log::Diag(1, "TRADE Async ExecutionEvent: execType=%d posId=%lld status=%d",
               execType, posId, posStatusInt);
 
     if (posId > 0) {
@@ -915,13 +915,7 @@ void HandleExecutionEvent(const char* buffer, int bufLen) {
 
                             Log::Info("TRADE", "Position auto-closed: zorroId=%d posId=%lld at %.5f NET=%.2f [server PnL]",
                                       zid, posId, closePrice, ti.profit);
-                        } else {
-                            Log::Info("TRADE", "Position auto-closed: zorroId=%d posId=%lld at %.5f [no detail]",
-                                      zid, posId, closePrice);
                         }
-                    } else {
-                        Log::Info("TRADE", "Position auto-closed: zorroId=%d posId=%lld at %.5f [no closePositionDetail]",
-                                  zid, posId, closePrice);
                     }
                 }
             }
@@ -999,11 +993,6 @@ bool RequestReconcile() {
 }
 
 void HandleReconcileRes(const char* buffer) {
-    // DEBUG: log first 500 chars of reconcile response
-    char snippet[500] = {};
-    strncpy_s(snippet, sizeof(snippet), buffer, sizeof(snippet) - 1);
-    Log::Info("RECON", "ReconcileRes (first 500): %s", snippet);
-
     // Parse position array from reconcile response
     const char* arr = Protocol::ExtractArray(buffer, "position");
     if (!arr || *arr == '\0' || (*arr == '[' && *(arr + 1) == ']')) {
@@ -1083,9 +1072,8 @@ void HandleReconcileRes(const char* buffer) {
         G.trades[zid] = ti;
         G.posIdToZorroId[posId] = zid;
 
-        Log::Info("TRADE", "Reconciled: zorroId=%d posId=%lld %s %s vol=%lld price=%.5f label=%s reconciled=%d",
-                  zid, posId, (side == 1) ? "BUY" : "SELL", symStr.c_str(), vol, price,
-                  label ? label : "(none)", (int)ti.reconciled);
+        Log::Diag(1, "TRADE Reconciled: zorroId=%d posId=%lld %s %s vol=%lld price=%.5f",
+                  zid, posId, (side == 1) ? "BUY" : "SELL", symStr.c_str(), vol, price);
 
         // Ensure nextZorroId is above all recovered IDs
         if (zid >= G.nextZorroId) G.nextZorroId = zid + 1;
@@ -1143,9 +1131,8 @@ void HandleReconcileRes(const char* buffer) {
             // Ensure nextZorroId is above all recovered IDs
             if (zid >= G.nextZorroId) G.nextZorroId = zid + 1;
 
-            Log::Info("TRADE", "Reconciled pending: zorroId=%d orderId=%lld %s vol=%lld type=%d label=%s reconciled=%d",
-                      zid, ordId, (side == 1) ? "BUY" : "SELL", vol, ordType,
-                      ordLabel ? ordLabel : "(none)", (int)ti.reconciled);
+            Log::Diag(1, "TRADE Reconciled pending: zorroId=%d orderId=%lld %s vol=%lld type=%d",
+                      zid, ordId, (side == 1) ? "BUY" : "SELL", vol, ordType);
         }
     }
 }
@@ -1348,13 +1335,13 @@ bool AmendPositionSltp(int tradeId, double stopLoss, double takeProfit) {
             }
 
             // Other execType — skip and keep waiting
-            Log::Info("TRADE", "AmendSLTP event execType=%d, waiting...", execType);
+            Log::Diag(1, "TRADE AmendSLTP event execType=%d, waiting...", execType);
             ResetTradingBuffer();
             continue;
         }
 
         // Unknown pt — skip
-        Log::Info("TRADE", "AmendSLTP: skipping unexpected pt=%d", pt);
+        Log::Diag(1, "TRADE AmendSLTP: skipping unexpected pt=%d", pt);
         ResetTradingBuffer();
         continue;
     }
