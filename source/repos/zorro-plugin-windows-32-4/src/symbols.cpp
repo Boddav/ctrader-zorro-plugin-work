@@ -173,16 +173,19 @@ void HandleSymbolByIdRes(const char* buffer) {
         sym.swapLong = Protocol::ExtractDouble(elem, "swapLong");
         sym.swapShort = Protocol::ExtractDouble(elem, "swapShort");
         sym.swapCalculationType = Protocol::ExtractInt(elem, "swapCalculationType");
+        sym.commissionRaw = Protocol::ExtractInt64(elem, "commission");
+        sym.commissionType = Protocol::ExtractInt(elem, "commissionType");
 
         // Default lotSize if not set
         if (sym.lotSize <= 0) sym.lotSize = 100000;
         if (sym.minVolume <= 0) sym.minVolume = 1000;
         if (sym.stepVolume <= 0) sym.stepVolume = 1000;
 
-        Log::Info("SYM", "DETAIL %s: lotSize=%lld minVol=%lld maxVol=%lld stepVol=%lld pipPos=%d digits=%d base=%lld quote=%lld swapL=%.4f swapS=%.4f swapType=%d",
+        Log::Info("SYM", "DETAIL %s: lotSize=%lld minVol=%lld maxVol=%lld stepVol=%lld pipPos=%d digits=%d base=%lld quote=%lld swapL=%.4f swapS=%.4f swapType=%d comm=%lld commType=%d",
                   it->second.c_str(), sym.lotSize, sym.minVolume, sym.maxVolume, sym.stepVolume,
                   sym.pipPosition, sym.digits, sym.baseAssetId, sym.quoteAssetId,
-                  sym.swapLong, sym.swapShort, sym.swapCalculationType);
+                  sym.swapLong, sym.swapShort, sym.swapCalculationType,
+                  sym.commissionRaw, sym.commissionType);
     }
 
     Log::Info("SYM", "Updated details for %d symbols", count);

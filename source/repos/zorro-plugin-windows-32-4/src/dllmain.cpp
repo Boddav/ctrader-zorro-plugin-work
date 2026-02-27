@@ -92,6 +92,69 @@ static double ConvertSwapToZorro(double swapValue, const SymbolInfo& sym) {
 }
 
 // ============================================================
+// M8b: Convert cTrader commission to Zorro pVolume format
+// Zorro expects: round-turn commission per 10,000 units, account currency
+// Negative = deducted from account (not included in spread)
+// cTrader commissionType: 1=USD_PER_MIL_USD, 2=USD_PER_LOT, 3=PERCENTAGE, 4=QUOTE_CCY_PER_LOT
+// cTrader commission is per SIDE (one-way), Zorro wants round-turn (both sides)
+// ============================================================
+static double ConvertCommissionToZorro(const SymbolInfo& sym) {
+    if (sym.commissionRaw == 0) return 0.0;
+
+    double moneyScale = pow(10.0, (double)G.moneyDigits);
+    double commPerSide = (double)sym.commissionRaw / moneyScale;  // actual $ per side
+    double unitsPerLot = (double)sym.lotSize / 100.0;  // 10M cents → 100K units
+    if (unitsPerLot <= 0.0) unitsPerLot = 100000.0;
+
+    double roundTripPer10K = 0.0;
+
+    switch (sym.commissionType) {
+    case 2: { // USD_PER_LOT (most common for forex)
+        // commPerSide = $ per lot per side
+        // Round-trip per 10K = 2 * commPerSide * 10000 / unitsPerLot
+        roundTripPer10K = 2.0 * commPerSide * 10000.0 / unitsPerLot;
+        break;
+    }
+    case 1: { // USD_PER_MIL_USD
+        // commPerSide = $ per $1M USD volume per side
+        // Need notional in USD per 10K units of the asset
+        double price = sym.ask > 0.0 ? sym.ask : sym.bid;
+        if (price <= 0.0) return 0.0;
+        double notionalUsdPer10K;
+        if (G.depositAssetId > 0 && sym.baseAssetId == G.depositAssetId) {
+            // Base = account currency (USD/JPY, USD/CAD, USD/CHF): 10K units = $10K
+            notionalUsdPer10K = 10000.0;
+        } else {
+            // Quote = account currency (EUR/USD, XAU/USD etc): notional = 10K × price
+            notionalUsdPer10K = 10000.0 * price;
+        }
+        roundTripPer10K = 2.0 * commPerSide * notionalUsdPer10K / 1000000.0;
+        break;
+    }
+    case 3: { // PERCENTAGE
+        // commPerSide = percentage of trade value per side
+        // Per 10K units: notional = price * 10000
+        // Round-trip per 10K = 2 * (commPerSide/100) * price * 10000
+        double price = sym.ask > 0.0 ? sym.ask : sym.bid;
+        if (price <= 0.0) return 0.0;
+        roundTripPer10K = 2.0 * (commPerSide / 100.0) * price * 10000.0;
+        break;
+    }
+    case 4: { // QUOTE_CCY_PER_LOT
+        // Same as USD_PER_LOT for USD-quoted pairs
+        // For non-USD quote, would need conversion (TODO)
+        roundTripPer10K = 2.0 * commPerSide * 10000.0 / unitsPerLot;
+        break;
+    }
+    default:
+        return 0.0;
+    }
+
+    // Negative = deducted from account (standard for real commissions)
+    return -roundTripPer10K;
+}
+
+// ============================================================
 // Network Thread - receives messages and dispatches
 // ============================================================
 
@@ -689,6 +752,12 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
         *pPip = 1.0 / pow(10.0, (double)sym.pipPosition);
     }
 
+    if (pVolume) {
+        // M8b: Commission from broker payload → Zorro pVolume
+        // Negative = deducted from account (not included in spread)
+        *pVolume = ConvertCommissionToZorro(sym);
+    }
+
     if (pLotAmount) {
         // M7: ComputeLotAmount clamps to min 1.0 for CFD indices
         // Forex(10M)=1000, Gold(10K)=1, Index(100)=1 (clamped)
@@ -745,14 +814,15 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
 
     G.currentSymbol = Asset;
 
-    Log::Info("ASSET", "%s: bid=%.5f ask=%.5f LotAmt=%.1f PipCost=%.6f MCost=%.4f marginPerLot=%.4f swapType=%d rawSwap=%.4f/%.4f Roll=%.4f/%.4f",
+    Log::Info("ASSET", "%s: bid=%.5f ask=%.5f LotAmt=%.1f PipCost=%.6f MCost=%.4f marginPerLot=%.4f swapType=%d rawSwap=%.4f/%.4f Roll=%.4f/%.4f Comm=%.4f(raw=%lld type=%d)",
               Asset, sym.bid, sym.ask,
               pLotAmount ? *pLotAmount : -1.0,
               pPipCost ? *pPipCost : -1.0,
               pMarginCost ? *pMarginCost : 0.0,
               sym.marginPerLot,
               sym.swapCalculationType, sym.swapLong, sym.swapShort,
-              pRollLong ? *pRollLong : 0.0, pRollShort ? *pRollShort : 0.0);
+              pRollLong ? *pRollLong : 0.0, pRollShort ? *pRollShort : 0.0,
+              pVolume ? *pVolume : 0.0, sym.commissionRaw, sym.commissionType);
 
     return 1;
 }

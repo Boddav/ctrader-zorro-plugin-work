@@ -48,6 +48,8 @@ struct SymbolInfo {
     double swapLong = 0.0;
     double swapShort = 0.0;
     int swapCalculationType = 0;  // 0=PIPS, 1=PERCENTAGE(annual), 2=POINTS
+    long long commissionRaw = 0;  // raw commission from SymbolByIdRes (moneyDigits scaled)
+    int commissionType = 0;       // 1=USD_PER_MIL_USD, 2=USD_PER_LOT, 3=PERCENTAGE, 4=QUOTE_CCY_PER_LOT
     double bid = 0.0;
     double ask = 0.0;
     double high = 0.0;
