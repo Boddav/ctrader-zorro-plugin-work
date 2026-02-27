@@ -20,9 +20,24 @@
 // lotSize is in cents (100 cents = 1 base unit)
 // Forex: 10M -> 1000, Gold: 10K -> 1, Index: 100 -> 1 (clamped)
 // ============================================================
-static double ComputeLotAmount(long long lotSize) {
+// M8: LotAmount from broker's minVolume (server payload)
+// minVolume = minimum tradeable volume from SymbolByIdRes
+// ZorroToVolume: Amount × 100 = cTrader volume
+// So: LotAmount = minVolume / 100 = base units per minimum trade
+// EUR/USD: minVol=100000 → LA=1000 (micro lot, 1000 EUR)
+// XAG/USD: minVol=1000   → LA=10   (10 oz, 0.01 cTrader lot)
+// XAU/USD: minVol=100    → LA=1    (1 oz, 0.01 cTrader lot)
+// CFD:     minVol=100    → LA=1    (1 contract)
+static double ComputeLotAmount(long long minVolume, long long lotSize) {
+    // Primary: use minVolume from broker (server-reported minimum trade)
+    if (minVolume > 0) {
+        double la = (double)minVolume / 100.0;
+        if (la < 1.0) la = 1.0;
+        return la;
+    }
+    // Fallback: lotSize / 10000 (old formula, if minVolume unavailable)
     double la = (double)lotSize / 10000.0;
-    if (la < 1.0 && lotSize > 0) la = 1.0;  // CFD/index minimum
+    if (la < 1.0 && lotSize > 0) la = 1.0;
     return la > 0.0 ? la : 1.0;
 }
 
@@ -34,7 +49,7 @@ static double ComputeLotAmount(long long lotSize) {
 static double ConvertSwapToZorro(double swapValue, const SymbolInfo& sym) {
     if (swapValue == 0.0) return 0.0;
 
-    double lotAmount = ComputeLotAmount(sym.lotSize);
+    double lotAmount = ComputeLotAmount(sym.minVolume, sym.lotSize);
     // Forex heuristic: LotAmount >= 100 (lotSize >= 1M cents = 10K+ base units)
     bool isForex = (lotAmount >= 100.0);
 
@@ -637,7 +652,7 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
 
         // Volume for 1 Zorro lot: LotAmount * 100 (in cTrader cents)
         // Forex(lotSize=10M): 100000, Gold(10K): 100, Index(100): 100 (clamped via ComputeLotAmount)
-        double la = ComputeLotAmount(sym.lotSize);
+        double la = ComputeLotAmount(sym.minVolume, sym.lotSize);
         long long marginVolume = (long long)(la * 100.0);
         if (marginVolume < 1) marginVolume = 1;
         char marginPayload[256];
@@ -677,14 +692,14 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
     if (pLotAmount) {
         // M7: ComputeLotAmount clamps to min 1.0 for CFD indices
         // Forex(10M)=1000, Gold(10K)=1, Index(100)=1 (clamped)
-        *pLotAmount = ComputeLotAmount(sym.lotSize);
+        *pLotAmount = ComputeLotAmount(sym.minVolume, sym.lotSize);
     }
 
     if (pPipCost) {
         // PIPCost = PIP * LotAmount * QuoteCurrencyToAccountRate
         // Must be in account currency (USD)
         double pip = 1.0 / pow(10.0, (double)sym.pipPosition);
-        double lotAmount = ComputeLotAmount(sym.lotSize);
+        double lotAmount = ComputeLotAmount(sym.minVolume, sym.lotSize);
         double price = sym.ask > 0.0 ? sym.ask : sym.bid;
 
         double quoteToAccountRate = 1.0;
@@ -714,7 +729,7 @@ DLLFUNC int BrokerAsset(char* Asset, double* pPrice, double* pSpread,
         } else if (G.leverageInCents > 0) {
             // Fallback: calculate from global leverage using dynamic LotAmount
             double price = sym.ask > 0.0 ? sym.ask : sym.bid;
-            double lotAmount = ComputeLotAmount(sym.lotSize);
+            double lotAmount = ComputeLotAmount(sym.minVolume, sym.lotSize);
             if (price > 0.0 && lotAmount > 0.0)
                 *pMarginCost = lotAmount * price / ((double)G.leverageInCents / 100.0);
             else
@@ -964,7 +979,7 @@ static int ReadHistoryCache(const char* asset, DATE tStart, DATE tEnd,
 }
 
 // Write T6 bars to History cache file
-// Merges with existing file data to keep the largest dataset
+// ALWAYS merges with existing file data to build the largest possible dataset
 static void WriteHistoryCache(const char* asset, T6* bars, int count) {
     if (count <= 0) return;
 
@@ -972,7 +987,7 @@ static void WriteHistoryCache(const char* asset, T6* bars, int count) {
     char path[MAX_PATH];
     BuildHistoryCachePath(path, MAX_PATH, asset, year);
 
-    // Read existing file to check size
+    // Read existing file (always, for merge)
     FILE* existing = nullptr;
     fopen_s(&existing, path, "rb");
     int existingCount = 0;
@@ -984,11 +999,11 @@ static void WriteHistoryCache(const char* asset, T6* bars, int count) {
         existingCount = (int)(fileSize / sizeof(T6));
         fseek(existing, 0, SEEK_SET);
 
-        if (existingCount > count) {
-            // Existing file has MORE bars - merge: keep existing, append newer
+        if (existingCount > 0) {
             existingBars = (T6*)malloc(existingCount * sizeof(T6));
             if (existingBars) {
-                fread(existingBars, sizeof(T6), existingCount, existing);
+                int nRead = (int)fread(existingBars, sizeof(T6), existingCount, existing);
+                if (nRead != existingCount) existingCount = nRead;
             }
         }
         fclose(existing);
@@ -1002,32 +1017,45 @@ static void WriteHistoryCache(const char* asset, T6* bars, int count) {
         return;
     }
 
-    if (existingBars && existingCount > count) {
-        // Merge: find where new data starts relative to existing
-        // Both are newest-first. Find overlap point.
+    if (existingBars && existingCount > 0) {
+        // Merge: combine new bars with existing, remove duplicates
+        // Both arrays are newest-first (descending time)
+        DATE newestNew = bars[0].time;
         DATE oldestNew = bars[count - 1].time;
         DATE newestExisting = existingBars[0].time;
+        DATE oldestExisting = existingBars[existingCount - 1].time;
 
-        if (bars[0].time > newestExisting) {
-            // New data extends beyond existing - write new data first, then old non-overlapping
+        // Write newest data first, then fill in older non-overlapping data
+        if (newestNew >= newestExisting) {
+            // New data is newer — write new first, then append older existing bars
             fwrite(bars, sizeof(T6), count, f);
+            int appended = 0;
             for (int i = 0; i < existingCount; i++) {
                 if (existingBars[i].time < oldestNew) {
                     fwrite(&existingBars[i], sizeof(T6), 1, f);
+                    appended++;
                 }
             }
-            Log::Info("HIST", "Cache MERGED: %s new=%d + existing older bars -> %s", asset, count, path);
+            Log::Info("HIST", "Cache MERGED: %s new=%d + %d older existing -> %s",
+                      asset, count, appended, path);
         } else {
-            // Existing data is newer or same - just keep existing
+            // Existing data is newer — write existing first, then append older new bars
             fwrite(existingBars, sizeof(T6), existingCount, f);
-            Log::Info("HIST", "Cache KEPT: %s existing %d bars (newer) in %s", asset, existingCount, path);
+            int appended = 0;
+            for (int i = 0; i < count; i++) {
+                if (bars[i].time < oldestExisting) {
+                    fwrite(&bars[i], sizeof(T6), 1, f);
+                    appended++;
+                }
+            }
+            Log::Info("HIST", "Cache MERGED: %s existing=%d + %d older new -> %s",
+                      asset, existingCount, appended, path);
         }
         free(existingBars);
     } else {
-        // No existing file or new data has more bars - write new data
+        // No existing file - write new data
         fwrite(bars, sizeof(T6), count, f);
         Log::Info("HIST", "Cache WROTE: %s %d bars -> %s", asset, count, path);
-        if (existingBars) free(existingBars);
     }
 
     fclose(f);
@@ -1259,11 +1287,27 @@ DLLFUNC int BrokerHistory2(char* Asset, DATE tStart, DATE tEnd,
     }
 
     // Try reading from History cache first (bar data only, not ticks)
+    // Only use cache if it covers enough of the requested time range,
+    // otherwise download fresh data from the API
     if (nTickMinutes > 0) {
         int cached = ReadHistoryCache(Asset, tStart, tEnd, nTickMinutes, nTicks, (T6*)ticks);
         if (cached > 0) {
-            Log::Info("HIST", "<<< BrokerHistory2 from cache: %s returned %d bars", Asset, cached);
-            return cached;
+            T6* cachedBars = (T6*)ticks;
+            DATE newestCached = cachedBars[0].time;          // newest (index 0)
+            DATE oldestCached = cachedBars[cached - 1].time;  // oldest (last index)
+            double requestedSpanDays = tEnd - tStart;
+            double cachedSpanDays = newestCached - oldestCached;
+            double coveragePct = (requestedSpanDays > 0.001) ? (100.0 * cachedSpanDays / requestedSpanDays) : 100.0;
+
+            // Accept cache if: filled the buffer (nTicks) OR covers >= 80% of requested span
+            if (cached >= nTicks || coveragePct >= 80.0) {
+                Log::Info("HIST", "<<< BrokerHistory2 from cache: %s returned %d bars (coverage %.1f%%)",
+                          Asset, cached, coveragePct);
+                return cached;
+            }
+            Log::Info("HIST", "Cache INSUFFICIENT: %s has %d bars covering %.1f%% of requested span (need 80%%), fetching from API",
+                      Asset, cached, coveragePct);
+            // Fall through to API download
         }
     }
 
@@ -1508,7 +1552,7 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
             if (sym.lotSize <= 0) return 0;
             // MinLot in Zorro lots: minVolume_cents / (LotAmount * 100)
-            double lotAmount = ComputeLotAmount(sym.lotSize);
+            double lotAmount = ComputeLotAmount(sym.minVolume, sym.lotSize);
             double minLot = (double)sym.minVolume / (lotAmount * 100.0);
             Log::Diag(1, "CMD GET_MINLOT %s: minVol=%lld lotSize=%lld lotAmt=%.1f -> %.4f",
                       G.currentSymbol.c_str(), sym.minVolume, sym.lotSize, lotAmount, minLot);
@@ -1519,7 +1563,7 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             SymbolInfo sym;
             if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
             if (sym.lotSize <= 0) return 0;
-            double lotAmount = ComputeLotAmount(sym.lotSize);
+            double lotAmount = ComputeLotAmount(sym.minVolume, sym.lotSize);
             return (double)sym.stepVolume / (lotAmount * 100.0);
         }
 
@@ -1527,7 +1571,7 @@ DLLFUNC double BrokerCommand(int Command, DWORD dwParameter) {
             SymbolInfo sym;
             if (G.currentSymbol.empty() || !Symbols::GetSymbol(G.currentSymbol.c_str(), sym)) return 0;
             if (sym.lotSize <= 0) return 0;
-            double lotAmount = ComputeLotAmount(sym.lotSize);
+            double lotAmount = ComputeLotAmount(sym.minVolume, sym.lotSize);
             return (double)sym.maxVolume / (lotAmount * 100.0);
         }
 
