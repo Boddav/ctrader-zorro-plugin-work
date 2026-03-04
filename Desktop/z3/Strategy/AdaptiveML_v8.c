@@ -57,11 +57,13 @@ function run()
 		if(trainStep == 1)
 		{
 			set(LOGFILE|PLOTNOW|RULES);
+			reset(PARAMETERS);
 			if(Bar == 0) printf("\n=== STEP 1: PERCEPTRON TRAINING ===\n");
 		}
 		else
 		{
 			set(LOGFILE|PLOTNOW|PARAMETERS);
+			reset(RULES);
 			if(Bar == 0) printf("\n=== STEP 2: PARAMETER OPTIMIZATION ===\n");
 		}
 	}
@@ -70,7 +72,7 @@ function run()
 
 	BarPeriod = 15;
 	LookBack = 300;
-	StartDate = 20200101;
+	StartDate = 20251101;
 	EndDate = 20260301;
 
 	Capital = 72000;
@@ -537,7 +539,11 @@ function run()
 		if(Train && trainStep == 2)
 		{
 			file_delete("Data\\AdaptiveML_v8_step1_done");
-			printf("\n>>> Step 2 KÉSZ! Nyomd meg [Test] <<<\n");
+			// .par fájlok másolása export néven
+			file_write("Data\\copy_v8_pars.bat",
+				"@echo off\r\ncopy /y \"Data\\AdaptiveML_v8.par\" \"Data\\AdaptiveML_v8_export.par\" >nul\r\nfor /L %%i in (1,1,8) do copy /y \"Data\\AdaptiveML_v8_%%i.par\" \"Data\\AdaptiveML_v8_export_%%i.par\" >nul 2>nul\r\n", 0);
+			exec("cmd", "/c Data\\copy_v8_pars.bat", 0);
+			printf("\n>>> Step 2 KÉSZ! .par fájlok exportra másolva. Nyomd meg [Test] <<<\n");
 		}
 	}
 }

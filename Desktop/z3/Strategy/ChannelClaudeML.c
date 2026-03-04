@@ -22,11 +22,13 @@ function run()
 		if(trainStep == 1)
 		{
 			set(LOGFILE|PLOTNOW|RULES);
+			reset(PARAMETERS);
 			if(Bar == 0) printf("\n=== STEP 1: PERCEPTRON TRAINING ===\n");
 		}
 		else
 		{
 			set(LOGFILE|PLOTNOW|PARAMETERS);
+			reset(RULES);
 			if(Bar == 0) printf("\n=== STEP 2: PARAMETER OPTIMIZATION ===\n");
 		}
 	}
