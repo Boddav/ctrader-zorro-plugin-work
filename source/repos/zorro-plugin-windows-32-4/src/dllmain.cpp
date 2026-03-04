@@ -817,41 +817,21 @@ DLLFUNC int BrokerAccount(char* Account, double* pBalance, double* pTradeVal,
     if (pBalance) *pBalance = G.balance;
 
     if (pTradeVal) {
-        // Calculate total unrealized PnL from all open trades
-        // First try server PnL cache (if fresh enough, <5s)
-        double totalPnL = 0.0;
-        bool usedCache = false;
+        // Unrealized PnL from server cache (Zorro-opened trades only)
+        // Refresh cache if stale (>5 seconds)
         ULONGLONG now = GetTickCount64();
-
-        if (G.pnlCacheTimeMs > 0 && (now - G.pnlCacheTimeMs) < 5000) {
-            CsLock lock(G.csTrades);
-            for (auto& kv : G.trades) {
-                if (!kv.second.open || kv.second.positionId <= 0) continue;
-                auto pnlIt = G.pnlCache.find(kv.second.positionId);
-                if (pnlIt != G.pnlCache.end()) {
-                    totalPnL += pnlIt->second.net;
-                    usedCache = true;
-                }
-            }
+        if (G.pnlCacheTimeMs == 0 || (now - G.pnlCacheTimeMs) > 5000) {
+            Trading::RefreshUnrealizedPnL();
         }
 
-        // Fallback: local calculation from current prices
-        if (!usedCache) {
-            CsLock lock(G.csTrades);
-            for (auto& kv : G.trades) {
-                if (!kv.second.open || kv.second.positionId <= 0) continue;
-                const TradeInfo& ti = kv.second;
-                SymbolInfo sym;
-                if (!Symbols::GetSymbol(ti.symbol.c_str(), sym)) continue;
-                double closePrice = (ti.tradeSide == 1) ? sym.bid : sym.ask;
-                if (closePrice <= 0.0) continue;
-                double priceDiff = (ti.tradeSide == 1)
-                    ? (closePrice - ti.openPrice)
-                    : (ti.openPrice - closePrice);
-                double profit = priceDiff * (double)ti.volume / 100.0;
-                // Cross-currency conversion (using 2118 chain)
-                profit *= Symbols::GetQuoteToDepositRate(sym);
-                totalPnL += profit;
+        double totalPnL = 0.0;
+        CsLock lock(G.csTrades);
+        for (auto& kv : G.trades) {
+            if (!kv.second.open || kv.second.positionId <= 0) continue;
+            if (kv.second.reconciled) continue;  // skip external positions
+            auto pnlIt = G.pnlCache.find(kv.second.positionId);
+            if (pnlIt != G.pnlCache.end()) {
+                totalPnL += pnlIt->second.net;
             }
         }
         *pTradeVal = totalPnL;

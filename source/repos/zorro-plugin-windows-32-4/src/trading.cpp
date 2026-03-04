@@ -679,6 +679,7 @@ int SellOrder(int tradeId, int amount, double limit,
                     if (it != G.trades.end()) {
                         if (fullyClosed) {
                             it->second.open = false;
+                            it->second.closePrice = closePrice;
                             it->second.profit = profit;
                             if (usedServerPnL) {
                                 // Server values are position totals — SET directly
@@ -782,7 +783,12 @@ int GetTradeStatus(int tradeId, double* pOpen, double* pClose,
     }
 
     if (!ti.open) {
-        Log::Diag(1, "TRADE GetTradeStatus: tradeId=%d is closed -> return -1", tradeId);
+        // Fill in closing data so Zorro books the correct server-side profit
+        if (pOpen) *pOpen = ti.openPrice;
+        if (pClose) *pClose = ti.closePrice;
+        if (pProfit) *pProfit = ti.profit;  // Server NET P&L from ExecutionEvent
+        if (pCost) *pCost = 0.0;            // Already in NET profit
+        Log::Diag(1, "TRADE GetTradeStatus: tradeId=%d closed profit=%.2f -> return -1", tradeId, ti.profit);
         return -1;  // trade closed = Zorro books P&L
     }
 
@@ -896,6 +902,7 @@ void HandleExecutionEvent(const char* buffer, int bufLen) {
                     ti.open = false;
                     // executionPrice is a JSON double
                     double closePrice = Protocol::ExtractDouble(buffer, "executionPrice");
+                    ti.closePrice = closePrice;
 
                     // Extract server P&L from closePositionDetail if available
                     const char* cpdStart = strstr(buffer, "\"closePositionDetail\"");
@@ -979,8 +986,12 @@ bool RequestReconcile() {
                 return true;
             }
             if (pt == ToInt(PayloadType::ErrorRes)) {
-                Log::Error("TRADE", "ReconcileReq error: %s",
-                          Protocol::ExtractString(response, "description"));
+                const char* desc = Protocol::ExtractString(response, "description");
+                if (desc && strstr(desc, "subscribe twice")) {
+                    Log::Warn("TRADE", "ReconcileReq: already subscribed (non-fatal)");
+                    return true;  // Execution subscription already active from AccountAuth
+                }
+                Log::Error("TRADE", "ReconcileReq error: %s", desc ? desc : "unknown");
                 return false;
             }
             // Other messages during reconcile: SpotEvent, MarginChanged, etc. - ignore

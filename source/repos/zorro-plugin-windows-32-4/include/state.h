@@ -70,6 +70,7 @@ struct TradeInfo {
     long long volume = 0;         // in cents
     int tradeSide = 0;            // 1=Buy, 2=Sell
     double openPrice = 0.0;
+    double closePrice = 0.0;       // set when position closes (from ExecutionEvent)
     double stopLoss = 0.0;
     double takeProfit = 0.0;
     double profit = 0.0;
