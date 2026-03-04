@@ -1,0 +1,212 @@
+===================================================================
+ CHANNEL CLAUDE ML v1 — Felhasznaloi Kezikonyv
+===================================================================
+
+ 1. ATTEKINTES
+===================================================================
+
+A ChannelClaudeML egy M15 idokeretes mean-reversion strategia,
+amely linearis regresszios csatornat (LinReg Channel) hasznal
+beleptesi jelkent, es PERCEPTRON gepi tanulassal szuri a
+trade-eket.
+
+Alapja: Financial Hacker "Trading the Channel" cikk.
+
+Instrumentumok: EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD
+Idokeret:       M15 (15 perces)
+Toke:           $2000 (backtest)
+Toke att:       500
+Hedge mod:      2 (long es short egyszerre nyithato)
+
+
+ 2. ELSO HASZNALAT — TREINING
+===================================================================
+
+A strategia ket lepesben treningel. Mindket lepest a [Train]
+gombbal inditod — a rendszer automatikusan detektalja,
+melyik lepesnel tart.
+
+  LEPES 1: PERCEPTRON trening
+  ----------------------------
+  1. Zorro-ban valaszd ki: ChannelClaudeML
+  2. Kattints [Train]
+  3. Varod meg amig befejezodik
+  4. Uzenet: "Step 1 KESZ! Nyomd meg ujra [Train] a Step 2-hoz"
+
+  Eredmeny: _ml.c fajlok (gepi tanulas sulyok)
+
+  LEPES 2: Parameter optimalizalas
+  ---------------------------------
+  1. Kattints ujra [Train]
+  2. Varod meg amig befejezodik
+  3. Uzenet: "Step 2 KESZ! Mindket lepes megvan. Nyomd meg [Test]"
+
+  Eredmeny: .par fajlok (optimalizalt parameterek per-asset)
+
+  TESZT
+  -----
+  1. Kattints [Test]
+  2. A rendszer betolti a _ml.c ES a .par fajlokat egyszerre
+  3. Eredmeny: backtest az optimalizalt parameterekkel
+
+
+ 3. SLIDEREK
+===================================================================
+
+  Slider 1: Margin (alapertelmezett: 15)
+  ----------------------------------------
+  Az equity hany szazalekat hasznaljuk egy trade margin-jakent.
+  Magasabb = nagyobb pozicio = nagyobb kockazat/nyereseg.
+  Ajanlott tartomany: 5-25
+
+  Slider 2: ML Thr (alapertelmezett: 0)
+  ----------------------------------------
+  PERCEPTRON ML szuro kuszobertek.
+  - 0 = barmilyen pozitiv ML jel engedelyezi a trade-et
+  - Magasabb = szigorubb szures (kevesebb, de jobb trade)
+  - Negativ = lazabb (tobb trade)
+  Ajanlott tartomany: -10 ... +20
+
+
+ 4. OPTIMALIZALT PARAMETEREK
+===================================================================
+
+A kovetkezo parameterek per-asset (instrumentumonkent) kulon
+ertekkent lesznek optimalizalva a Step 2 soran:
+
+  N (LinReg hossz)      20-80, lepes 5    (default: 40)
+  Factor (csatorna)     0.05-0.5, lepes 0.05  (default: 0.2)
+  stopMult (ATR szorzo) 1.5-5.0, lepes 0.5   (default: 3.0)
+  LifeTime (max barok)  10-40, lepes 5     (default: 20)
+
+Ezek az ertekek a Data\ChannelClaudeML*.par fajlokba mentodnek.
+
+
+ 5. HOGYAN MUKODIK A STRATEGIA
+===================================================================
+
+  BELEPESI LOGIKA:
+  1. LinReg Channel szamitas (N baros linearis regresszio)
+  2. Ha az ar a csatorna alja ala megy → LONG jel
+  3. Ha az ar a csatorna teteje fole megy → SHORT jel
+  4. PERCEPTRON ML szuro: 8 feature alapjan donti el, engedelyezi-e
+  5. ML score > MLThresh → trade megnyilik
+
+  KILEPESI LOGIKA:
+  - Ellentetes csatorna szel (long → ar felul kilep)
+  - Stop Loss: H1 ATR x stopMult
+  - LifeTime: maximum N bar utan automatikusan zarod
+
+  SESSION FILTER (UTC idopontok):
+  EUR/USD:  07:00 - 21:00
+  GBP/USD:  07:00 - 21:00
+  USD/JPY:  00:00 - 16:00
+  AUD/USD:  22:00 - 08:00 (ejszakai session)
+  USD/CAD:  13:00 - 21:00
+
+  SKIP FILTER:
+  - h1atr < PIP*5 → kihagyja (tul alacsony volatilitas)
+  - ChannelWidth < PIP*3 → kihagyja (tul szuk csatorna)
+
+  ML FEATURES (8 darab, mind [-1..+1] normalizalt):
+  0: chanPos   — pozicio a csatornan belul
+  1: slope     — LinReg meredekseg
+  2: widthATR  — csatorna szelesseg / H1 ATR
+  3: rsi       — RSI(14) normalizalt
+  4: adx       — ADX(14) normalizalt
+  5: chg1      — 1-bar arvaltozas
+  6: chg4      — 4-bar arvaltozas
+  7: rng4      — 4-bar range
+
+
+ 6. AUTOMATIKUS UJRATRAINELES
+===================================================================
+
+Az auto_retrain.bat fajl automatizalja a hetenkenti ujratreninget.
+
+Telepites:
+  1. Nyisd meg: Windows Task Scheduler (taskschd.msc)
+  2. Uj feladat letrehozasa:
+     - Nev: "ChannelClaudeML Auto Retrain"
+     - Trigger: Pentek 22:30 UTC (piaczaras utan)
+     - Muvelet: Program inditasa
+       - Program: C:\Users\Administrator\Desktop\z3\Strategy\auto_retrain.bat
+       - Inditas helye: C:\Users\Administrator\Desktop\z3
+  3. Beallitasok:
+     - "Futtatas akkor is, ha a felhasznalo nincs bejelentkezve"
+     - "Futtatas a legnagyobb jogosultsagokkal"
+
+A batch ket lepest hajt vegre automatikusan:
+  - Step 1: Zorro.exe -train ChannelClaudeML (PERCEPTRON)
+  - 10 mp varakozas
+  - Step 2: Zorro.exe -train ChannelClaudeML (PARAMETERS)
+
+Naplo: Strategy\retrain_log.txt
+
+
+ 7. ELO KERESKEDES
+===================================================================
+
+  1. Eloszor vegezd el a treninget (Step 1 + Step 2)
+  2. Valaszd ki: ChannelClaudeML
+  3. Allitsd be a slidereket (Margin, ML Thr)
+  4. Kattints [Trade]
+  5. A rendszer automatikusan betolti a _ml.c es .par fajlokat
+
+  FONTOS:
+  - MaxLong = MaxShort = 1 (csak 1 long + 1 short per asset)
+  - brokerTrades(0) hivodik TRADEMODE-ban (meglevo poziciok szinkron)
+  - EndWeek = 52200 (pentek 22:00 UTC zaras)
+  - StopFactor = 1.5
+
+
+ 8. FAJLOK
+===================================================================
+
+  Strategy/ChannelClaudeML.c        — fo strategia
+  Strategy/auto_retrain.bat         — automatikus ujratraining
+  Strategy/retrain_log.txt          — training naplo (auto-generated)
+  Data/ChannelClaudeML*.par         — optimalizalt parameterek
+  Data/ChannelClaudeML*_ml.c        — PERCEPTRON sulyok
+  Data/ChannelClaudeML_step1_done   — flag fajl (training kozben)
+  Log/ChannelClaudeML.htm           — backtest eredmenyek
+
+
+ 9. HIBAELHARITAS
+===================================================================
+
+  "Error 044: No rule for ..."
+  → Nem volt PERCEPTRON trening. Futtasd [Train]-t (Step 1).
+
+  Stop = 0.00001 vagy nagyon kis ertek
+  → h1atr kozel nulla. A skip filter kiszuri, de ha megis elojon,
+    ellenorizd hogy az adatforras mukodik-e (broker kapcsolat).
+
+  Step 2 nem indul el
+  → A Data\ChannelClaudeML_step1_done fajl letezik-e?
+    Ha torolt vagy serult, keszits egyet manuslisan:
+    echo 1 > Data\ChannelClaudeML_step1_done
+    Majd futtasd ujra [Train]-t.
+
+  Csak 1 asset optimalizalodik
+  → Ez NORMALIS a ket lepcsos rendszerben. Step 1 = RULES (mind),
+    Step 2 = PARAMETERS (mind). Ne hasznalj set(RULES|PARAMETERS)-t
+    egyszerre multi-asset WFO-ban!
+
+
+ 10. BACKTEST EREDMENYEK
+===================================================================
+
+  Optimalizalas nelkul (eredeti):
+  - PF 2.57, SR 2.96, 547 trades (2 ev adat)
+  - Fix parameterek: N=40, Factor=0.2, Stop=ATR*3
+
+  Optimalizalassal (per-asset):
+  - Capital: $2,000 → $21,021
+  - PF 1.18, SR 1.19, R2 0.87
+  - Teljes idoszak: 2024.01 - 2026.03
+
+
+===================================================================
+ (c) 2026 — ChannelClaudeML v1 User Manual
+===================================================================
