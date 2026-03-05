@@ -840,27 +840,23 @@ DLLFUNC int BrokerAccount(char* Account, double* pBalance, double* pTradeVal,
     if (pBalance) *pBalance = G.balance;
 
     if (pTradeVal) {
-        // Unrealized PnL for ALL positions (Zorro + external strategies)
-        // Primary: server equity from MarginChangedEvent (2141) / TraderReq (2121)
-        // Fallback: sum ALL pnlCache entries from GetPosUnrealizedPnLReq (2187)
-
-        // Also refresh PnL cache if stale (>5s)
+        // Net Unrealized PnL from server (2187/2188) — strategy-opened positions only
+        // Net = gross + swap + commission (real value if all positions closed now)
         if (G.pnlCacheTimeMs == 0 || (now - G.pnlCacheTimeMs) > 5000) {
             Trading::RefreshUnrealizedPnL();
         }
 
-        if (G.equity > 0.0 && G.balance > 0.0 && G.accountRefreshMs > 0) {
-            // Server equity includes ALL positions' net unrealized PnL
-            *pTradeVal = G.equity - G.balance;
-        } else {
-            // Fallback: sum ALL server PnL cache entries (all positions on account)
-            double totalPnL = 0.0;
-            CsLock lock(G.csTrades);
-            for (auto& kv : G.pnlCache) {
-                totalPnL += kv.second.net;
+        double totalPnL = 0.0;
+        CsLock lock(G.csTrades);
+        for (auto& kv : G.trades) {
+            if (!kv.second.open || kv.second.positionId <= 0) continue;
+            if (kv.second.reconciled) continue;  // exclude external positions
+            auto pnlIt = G.pnlCache.find(kv.second.positionId);
+            if (pnlIt != G.pnlCache.end()) {
+                totalPnL += pnlIt->second.net;
             }
-            *pTradeVal = totalPnL;
         }
+        *pTradeVal = totalPnL;
     }
 
     if (pMarginVal) {
