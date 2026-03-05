@@ -297,6 +297,18 @@ static unsigned __stdcall NetworkThread(void* param) {
             continue;
         }
 
+        // DealListByPositionIdRes during trading mode → forward to trading
+        if (G.waitingForTrading && pt == ToInt(PayloadType::DealListByPositionIdRes)) {
+            CsLock lock(G.csTrading);
+            int copyLen = (n < State::TRADE_BUF_SIZE - 1) ? n : State::TRADE_BUF_SIZE - 1;
+            memcpy(G.tradingResponseBuf, buffer, copyLen);
+            G.tradingResponseBuf[copyLen] = '\0';
+            G.tradingResponsePt = pt;
+            G.tradingResponseExecType = 0;
+            G.tradingResponseReady = true;
+            continue;
+        }
+
         // ErrorRes during trading mode → forward to trading
         if (G.waitingForTrading && pt == ToInt(PayloadType::ErrorRes)) {
             CsLock lock(G.csTrading);

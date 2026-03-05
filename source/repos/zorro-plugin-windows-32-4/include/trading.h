@@ -29,6 +29,10 @@ void HandleReconcileRes(const char* buffer);
 // Request position reconciliation (called after login)
 bool RequestReconcile();
 
+// Query server for closed position deals (DealListByPositionIdReq 2179)
+// Returns true if position confirmed closed, fills closePrice/profit
+bool QueryClosedPositionFromServer(long long positionId, double* closePrice, double* profit);
+
 // Cancel a pending order (DO_CANCEL)
 bool CancelOrder(int tradeId);
 

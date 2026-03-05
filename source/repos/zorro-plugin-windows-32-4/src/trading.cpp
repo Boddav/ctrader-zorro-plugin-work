@@ -542,194 +542,267 @@ int SellOrder(int tradeId, int amount, double limit,
         if (closeVol > ti.volume) closeVol = ti.volume;
     }
 
-    // Build ClosePositionReq payload
-    char payload[512];
-    sprintf_s(payload,
-        "\"ctidTraderAccountId\":%lld,"
-        "\"positionId\":%lld,"
-        "\"volume\":%lld",
-        G.accountId, ti.positionId, closeVol);
+    // Retry loop: attempt close, verify position state on failure
+    static const int MAX_CLOSE_ATTEMPTS = 3;
 
-    const char* msgId = Utils::NextMsgId();
-    const char* msg = Protocol::BuildMessage(msgId, PayloadType::ClosePositionReq, payload);
+    for (int attempt = 0; attempt < MAX_CLOSE_ATTEMPTS; attempt++) {
 
-    Log::Info("TRADE", "ClosePosition: tradeId=%d posId=%lld vol=%lld/%lld",
-              lookupId, ti.positionId, closeVol, ti.volume);
-
-    // Set waiting flag and send
-    {
-        CsLock lock(G.csTrading);
-        ResetTradingBuffer();
-        G.waitingForTrading = true;
-    }
-
-    if (!WebSocket::Send(msg)) {
-        Log::Error("TRADE", "ClosePosition send failed");
-        G.waitingForTrading = false;
-        return lookupId;
-    }
-
-    // Wait for response — ClosePosition also gets ACCEPTED before FILLED
-    for (int eventCount = 0; eventCount < 10; eventCount++) {
-        bool gotResponse = WaitForTradingResponse(G.waitTime);
-
-        if (!gotResponse) {
-            G.waitingForTrading = false;
-            Log::Error("TRADE", "ClosePosition timeout (%dms) after %d events", G.waitTime, eventCount);
-            return lookupId;
+        if (attempt > 0) {
+            Log::Info("TRADE", "ClosePosition retry %d/%d: tradeId=%d posId=%lld",
+                      attempt + 1, MAX_CLOSE_ATTEMPTS, lookupId, ti.positionId);
+            Sleep(500 * attempt);
         }
 
-        CsLock tlock(G.csTrading);
-        int pt = G.tradingResponsePt;
+        // Build ClosePositionReq payload
+        char payload[512];
+        sprintf_s(payload,
+            "\"ctidTraderAccountId\":%lld,"
+            "\"positionId\":%lld,"
+            "\"volume\":%lld",
+            G.accountId, ti.positionId, closeVol);
 
-        if (pt == ToInt(PayloadType::ErrorRes)) {
-            G.waitingForTrading = false;
-            const char* desc = Protocol::ExtractString(G.tradingResponseBuf, "description");
-            Log::Error("TRADE", "ClosePosition error: %s", desc);
-            return lookupId;
+        const char* msgId = Utils::NextMsgId();
+        const char* msg = Protocol::BuildMessage(msgId, PayloadType::ClosePositionReq, payload);
+
+        Log::Info("TRADE", "ClosePosition: tradeId=%d posId=%lld vol=%lld/%lld (attempt %d)",
+                  lookupId, ti.positionId, closeVol, ti.volume, attempt + 1);
+
+        // Set waiting flag and send
+        {
+            CsLock lock(G.csTrading);
+            ResetTradingBuffer();
+            G.waitingForTrading = true;
         }
 
-        if (pt == ToInt(PayloadType::OrderErrorEvent)) {
+        if (!WebSocket::Send(msg)) {
+            Log::Error("TRADE", "ClosePosition send failed");
             G.waitingForTrading = false;
-            const char* desc = Protocol::ExtractString(G.tradingResponseBuf, "description");
-            Log::Error("TRADE", "ClosePosition order error: %s", desc);
-            return lookupId;
+            // Check if position was closed externally (SL/TP) before retrying
+            goto check_if_closed;
         }
 
-        if (pt == ToInt(PayloadType::ExecutionEvent)) {
-            int execType = G.tradingResponseExecType;
-            const char* buf = G.tradingResponseBuf;
+        // Wait for response — ClosePosition also gets ACCEPTED before FILLED
+        for (int eventCount = 0; eventCount < 10; eventCount++) {
+            bool gotResponse = WaitForTradingResponse(G.waitTime);
 
-            if (execType == 3 || execType == 11) {
-                // FILLED or PARTIAL_FILL
+            if (!gotResponse) {
                 G.waitingForTrading = false;
+                Log::Error("TRADE", "ClosePosition timeout (%dms) after %d events", G.waitTime, eventCount);
+                goto check_if_closed;
+            }
 
-                // executionPrice is a JSON double
-                double closePrice = Protocol::ExtractDouble(buf, "executionPrice");
-                long long filledVol = Protocol::ExtractInt64(buf, "filledVolume");
-                if (filledVol <= 0) filledVol = closeVol;
+            CsLock tlock(G.csTrading);
+            int pt = G.tradingResponsePt;
 
-                bool fullyClosed = IsPositionClosed(buf);
-                if (!fullyClosed && filledVol >= ti.volume) {
-                    fullyClosed = true;
-                }
+            if (pt == ToInt(PayloadType::ErrorRes)) {
+                G.waitingForTrading = false;
+                const char* desc = Protocol::ExtractString(G.tradingResponseBuf, "description");
+                Log::Error("TRADE", "ClosePosition error: %s", desc);
+                goto check_if_closed;
+            }
 
-                double profit = 0.0;
-                double commission = 0.0;
-                double swap = 0.0;
-                bool usedServerPnL = false;
+            if (pt == ToInt(PayloadType::OrderErrorEvent)) {
+                G.waitingForTrading = false;
+                const char* desc = Protocol::ExtractString(G.tradingResponseBuf, "description");
+                Log::Error("TRADE", "ClosePosition order error: %s", desc);
+                goto check_if_closed;
+            }
 
-                // Try server-calculated P&L from closePositionDetail
-                // grossProfit is unique to closePositionDetail (no field name conflicts)
-                const char* cpdStart = strstr(buf, "\"closePositionDetail\"");
-                if (cpdStart) {
-                    const char* cpdObj = strchr(cpdStart, '{');
-                    if (cpdObj) {
-                        // Extract from within closePositionDetail sub-object
-                        // to avoid conflicts with deal/position-level swap/commission
-                        int md = Protocol::ExtractInt(cpdObj, "moneyDigits");
-                        double detailScale = (md > 0) ? pow(10.0, (double)md) : pow(10.0, (double)G.moneyDigits);
+            if (pt == ToInt(PayloadType::ExecutionEvent)) {
+                int execType = G.tradingResponseExecType;
+                const char* buf = G.tradingResponseBuf;
 
-                        long long grossRaw = Protocol::ExtractInt64(cpdObj, "grossProfit");
-                        long long swapRaw = Protocol::ExtractInt64(cpdObj, "swap");
-                        long long commRaw = Protocol::ExtractInt64(cpdObj, "commission");
+                if (execType == 3 || execType == 11) {
+                    // FILLED or PARTIAL_FILL
+                    G.waitingForTrading = false;
 
-                        double grossProfit = (double)grossRaw / detailScale;
-                        swap = (double)swapRaw / detailScale;
-                        commission = (double)commRaw / detailScale;
+                    // executionPrice is a JSON double
+                    double closePrice = Protocol::ExtractDouble(buf, "executionPrice");
+                    long long filledVol = Protocol::ExtractInt64(buf, "filledVolume");
+                    if (filledVol <= 0) filledVol = closeVol;
 
-                        // NET P&L = gross + swap + commission (swap/commission are negative costs)
-                        profit = grossProfit + swap + commission;
-                        usedServerPnL = true;
-
-                        Log::Info("TRADE", "CloseDetail: gross=%.2f swap=%.2f comm=%.2f NET=%.2f (raw g=%lld s=%lld c=%lld scale=%.0f)",
-                                  grossProfit, swap, commission, profit, grossRaw, swapRaw, commRaw, detailScale);
+                    bool fullyClosed = IsPositionClosed(buf);
+                    if (!fullyClosed && filledVol >= ti.volume) {
+                        fullyClosed = true;
                     }
+
+                    double profit = 0.0;
+                    double commission = 0.0;
+                    double swap = 0.0;
+                    bool usedServerPnL = false;
+
+                    // Try server-calculated P&L from closePositionDetail
+                    // grossProfit is unique to closePositionDetail (no field name conflicts)
+                    const char* cpdStart = strstr(buf, "\"closePositionDetail\"");
+                    if (cpdStart) {
+                        const char* cpdObj = strchr(cpdStart, '{');
+                        if (cpdObj) {
+                            // Extract from within closePositionDetail sub-object
+                            // to avoid conflicts with deal/position-level swap/commission
+                            int md = Protocol::ExtractInt(cpdObj, "moneyDigits");
+                            double detailScale = (md > 0) ? pow(10.0, (double)md) : pow(10.0, (double)G.moneyDigits);
+
+                            long long grossRaw = Protocol::ExtractInt64(cpdObj, "grossProfit");
+                            long long swapRaw = Protocol::ExtractInt64(cpdObj, "swap");
+                            long long commRaw = Protocol::ExtractInt64(cpdObj, "commission");
+
+                            double grossProfit = (double)grossRaw / detailScale;
+                            swap = (double)swapRaw / detailScale;
+                            commission = (double)commRaw / detailScale;
+
+                            // NET P&L = gross + swap + commission (swap/commission are negative costs)
+                            profit = grossProfit + swap + commission;
+                            usedServerPnL = true;
+
+                            Log::Info("TRADE", "CloseDetail: gross=%.2f swap=%.2f comm=%.2f NET=%.2f (raw g=%lld s=%lld c=%lld scale=%.0f)",
+                                      grossProfit, swap, commission, profit, grossRaw, swapRaw, commRaw, detailScale);
+                        }
+                    }
+
+                    // Fallback: local calculation (if server didn't provide closePositionDetail)
+                    if (!usedServerPnL) {
+                        double scale = pow(10.0, (double)G.moneyDigits);
+                        commission = (double)Protocol::ExtractInt64(buf, "commission") / scale;
+                        swap = (double)Protocol::ExtractInt64(buf, "swap") / scale;
+
+                        double lotAmount = (double)sym.lotSize / 100.0;
+                        double lots = (double)filledVol / (double)sym.lotSize;
+                        double priceDiff = (ti.tradeSide == 1)
+                            ? (closePrice - ti.openPrice)
+                            : (ti.openPrice - closePrice);
+                        profit = priceDiff * lots * lotAmount;
+
+                        // Cross-currency conversion: quote -> deposit (M9: full chain)
+                        profit *= Symbols::GetQuoteToDepositRate(sym);
+
+                        // Include costs for NET consistency with server path
+                        profit += ti.swap + ti.commission + swap + commission;
+                    }
+
+                    if (pClose) *pClose = closePrice;
+                    if (pCost) *pCost = 0.0;  // costs already in NET profit
+                    if (pProfit) *pProfit = profit;
+                    if (pFill) *pFill = VolumeToZorro(filledVol, ti.tradeSide);
+
+                    // Update trade state
+                    {
+                        CsLock lock(G.csTrades);
+                        auto it = G.trades.find(lookupId);
+                        if (it != G.trades.end()) {
+                            if (fullyClosed) {
+                                it->second.open = false;
+                                it->second.closePrice = closePrice;
+                                it->second.profit = profit;
+                                if (usedServerPnL) {
+                                    // Server values are position totals — SET directly
+                                    it->second.commission = commission;
+                                    it->second.swap = swap;
+                                } else {
+                                    it->second.commission += commission;
+                                    it->second.swap += swap;
+                                }
+                            } else {
+                                it->second.volume -= filledVol;
+                                it->second.commission += commission;
+                                it->second.swap += swap;
+                            }
+                        }
+                    }
+
+                    Log::Info("TRADE", "Position %s: tradeId=%d price=%.5f profit=%.2f %s%s",
+                              fullyClosed ? "closed" : "partially closed",
+                              lookupId, closePrice, profit,
+                              fullyClosed ? "" : "(still open)",
+                              usedServerPnL ? " [server PnL]" : " [local calc]");
+
+                    // BrokerSell2 return: tradeId = success, 0 = failure
+                    return lookupId;
                 }
-
-                // Fallback: local calculation (if server didn't provide closePositionDetail)
-                if (!usedServerPnL) {
-                    double scale = pow(10.0, (double)G.moneyDigits);
-                    commission = (double)Protocol::ExtractInt64(buf, "commission") / scale;
-                    swap = (double)Protocol::ExtractInt64(buf, "swap") / scale;
-
-                    double lotAmount = (double)sym.lotSize / 100.0;
-                    double lots = (double)filledVol / (double)sym.lotSize;
-                    double priceDiff = (ti.tradeSide == 1)
-                        ? (closePrice - ti.openPrice)
-                        : (ti.openPrice - closePrice);
-                    profit = priceDiff * lots * lotAmount;
-
-                    // Cross-currency conversion: quote -> deposit (M9: full chain)
-                    profit *= Symbols::GetQuoteToDepositRate(sym);
-
-                    // Include costs for NET consistency with server path
-                    profit += ti.swap + ti.commission + swap + commission;
+                else if (execType == 2 || execType == 4 || execType == 5) {
+                    // ACCEPTED / ORDER_REPLACED / ORDER_CANCELLED
+                    // Close operation gets ACCEPTED before FILLED, skip and wait
+                    Log::Diag(1, "TRADE ClosePosition event execType=%d (event %d), waiting...", execType, eventCount);
+                    ResetTradingBuffer();
+                    continue;
                 }
+                else {
+                    // Other execution types — skip and keep waiting
+                    Log::Diag(1, "TRADE ClosePosition event execType=%d (event %d), skipping...", execType, eventCount);
+                    ResetTradingBuffer();
+                    continue;
+                }
+            }
 
-                if (pClose) *pClose = closePrice;
-                if (pCost) *pCost = 0.0;  // costs already in NET profit
-                if (pProfit) *pProfit = profit;
-                if (pFill) *pFill = VolumeToZorro(filledVol, ti.tradeSide);
+            // Unknown payloadType — skip and keep waiting
+            Log::Diag(1, "TRADE ClosePosition: skipping unexpected pt=%d (event %d)", pt, eventCount);
+            ResetTradingBuffer();
+            continue;
+        }
 
-                // Update trade state
+        G.waitingForTrading = false;
+        Log::Error("TRADE", "ClosePosition: too many events without FILLED");
+        // Fall through to check_if_closed
+
+check_if_closed:
+        // Close command failed — check if position was already closed (SL/TP/external)
+        // Step 1: Give async ExecutionEvent a moment to arrive and update G.trades
+        Sleep(200);
+
+        {
+            CsLock lock(G.csTrades);
+            auto it = G.trades.find(lookupId);
+            if (it != G.trades.end() && !it->second.open) {
+                // Position was closed externally (SL/TP hit during our close attempt)
+                TradeInfo& closed = it->second;
+                if (pClose) *pClose = closed.closePrice;
+                if (pProfit) *pProfit = closed.profit;
+                if (pCost) *pCost = 0.0;
+                if (pFill) *pFill = VolumeToZorro(ti.volume, ti.tradeSide);
+
+                Log::Info("TRADE", "ClosePosition: tradeId=%d already closed externally (SL/TP), price=%.5f profit=%.2f",
+                          lookupId, closed.closePrice, closed.profit);
+                return lookupId;
+            }
+        }
+
+        // Step 2: Query server for deal history of this position (DealListByPositionIdReq 2179)
+        {
+            double serverClosePrice = 0.0, serverProfit = 0.0;
+            if (QueryClosedPositionFromServer(ti.positionId, &serverClosePrice, &serverProfit)) {
+                // Server confirmed position is closed — update local state and return success
                 {
                     CsLock lock(G.csTrades);
                     auto it = G.trades.find(lookupId);
                     if (it != G.trades.end()) {
-                        if (fullyClosed) {
-                            it->second.open = false;
-                            it->second.closePrice = closePrice;
-                            it->second.profit = profit;
-                            if (usedServerPnL) {
-                                // Server values are position totals — SET directly
-                                it->second.commission = commission;
-                                it->second.swap = swap;
-                            } else {
-                                it->second.commission += commission;
-                                it->second.swap += swap;
-                            }
-                        } else {
-                            it->second.volume -= filledVol;
-                            it->second.commission += commission;
-                            it->second.swap += swap;
-                        }
+                        it->second.open = false;
+                        it->second.closePrice = serverClosePrice;
+                        it->second.profit = serverProfit;
                     }
                 }
 
-                Log::Info("TRADE", "Position %s: tradeId=%d price=%.5f profit=%.2f %s%s",
-                          fullyClosed ? "closed" : "partially closed",
-                          lookupId, closePrice, profit,
-                          fullyClosed ? "" : "(still open)",
-                          usedServerPnL ? " [server PnL]" : " [local calc]");
+                if (pClose) *pClose = serverClosePrice;
+                if (pProfit) *pProfit = serverProfit;
+                if (pCost) *pCost = 0.0;
+                if (pFill) *pFill = VolumeToZorro(ti.volume, ti.tradeSide);
 
-                // BrokerSell2 return: tradeId = success, 0 = failure
+                Log::Info("TRADE", "ClosePosition: tradeId=%d confirmed closed by server query, price=%.5f profit=%.2f",
+                          lookupId, serverClosePrice, serverProfit);
                 return lookupId;
             }
-            else if (execType == 2 || execType == 4 || execType == 5) {
-                // ACCEPTED / ORDER_REPLACED / ORDER_CANCELLED
-                // Close operation gets ACCEPTED before FILLED, skip and wait
-                Log::Diag(1, "TRADE ClosePosition event execType=%d (event %d), waiting...", execType, eventCount);
-                ResetTradingBuffer();
-                continue;
-            }
-            else {
-                // Other execution types — skip and keep waiting
-                Log::Diag(1, "TRADE ClosePosition event execType=%d (event %d), skipping...", execType, eventCount);
-                ResetTradingBuffer();
-                continue;
-            }
+
+            Log::Info("TRADE", "ClosePosition: server query found no closing deal — position still open");
         }
 
-        // Unknown payloadType — skip and keep waiting
-        Log::Diag(1, "TRADE ClosePosition: skipping unexpected pt=%d (event %d)", pt, eventCount);
-        ResetTradingBuffer();
-        continue;
-    }
+        // Step 3: Position still open — retry if attempts remain
+        if (attempt < MAX_CLOSE_ATTEMPTS - 1) {
+            continue;  // retry close
+        }
 
-    G.waitingForTrading = false;
-    Log::Error("TRADE", "ClosePosition: too many events without FILLED");
-    return lookupId;
+    } // end retry loop
+
+    Log::Error("TRADE", "ClosePosition failed after %d attempts: tradeId=%d posId=%lld",
+               MAX_CLOSE_ATTEMPTS, lookupId, ti.positionId);
+    return 0;  // all retries exhausted = failure
 }
 
 // ============================================================
@@ -954,6 +1027,122 @@ void HandleOrderErrorEvent(const char* buffer, int bufLen) {
     // Async error
     const char* desc = Protocol::ExtractString(buffer, "description");
     Log::Error("TRADE", "Async OrderError: %s", desc);
+}
+
+// ============================================================
+// QueryClosedPositionFromServer - DealListByPositionIdReq 2179
+// ============================================================
+
+bool QueryClosedPositionFromServer(long long positionId, double* closePrice, double* profit) {
+    if (!G.loggedIn || positionId <= 0) return false;
+
+    char payload[256];
+    sprintf_s(payload,
+        "\"ctidTraderAccountId\":%lld,"
+        "\"positionId\":%lld",
+        G.accountId, positionId);
+
+    const char* msgId = Utils::NextMsgId();
+    const char* msg = Protocol::BuildMessage(msgId, PayloadType::DealListByPositionIdReq, payload);
+
+    Log::Info("TRADE", "QueryClosedPosition: posId=%lld (DealListByPositionIdReq)", positionId);
+
+    // Use trading buffer pattern (NetworkThread forwards DealListByPositionIdRes)
+    {
+        CsLock lock(G.csTrading);
+        ResetTradingBuffer();
+        G.waitingForTrading = true;
+    }
+
+    if (!WebSocket::Send(msg)) {
+        Log::Error("TRADE", "QueryClosedPosition send failed");
+        G.waitingForTrading = false;
+        return false;
+    }
+
+    bool gotResponse = WaitForTradingResponse(G.waitTime);
+    G.waitingForTrading = false;
+
+    if (!gotResponse) {
+        Log::Error("TRADE", "QueryClosedPosition timeout");
+        return false;
+    }
+
+    CsLock tlock(G.csTrading);
+    int pt = G.tradingResponsePt;
+
+    if (pt == ToInt(PayloadType::ErrorRes)) {
+        const char* desc = Protocol::ExtractString(G.tradingResponseBuf, "description");
+        Log::Error("TRADE", "QueryClosedPosition error: %s", desc);
+        return false;
+    }
+
+    if (pt != ToInt(PayloadType::DealListByPositionIdRes)) {
+        Log::Error("TRADE", "QueryClosedPosition: unexpected pt=%d", pt);
+        return false;
+    }
+
+    // Parse deal array — look for SELL deal (close side) with closingDeal=true or last deal
+    const char* buf = G.tradingResponseBuf;
+    const char* arr = Protocol::ExtractArray(buf, "deal");
+    if (!arr || *arr == '\0' || (*arr == '[' && *(arr + 1) == ']')) {
+        Log::Warn("TRADE", "QueryClosedPosition: no deals found for posId=%lld", positionId);
+        return false;
+    }
+
+    int dealCount = Protocol::CountArrayElements(arr);
+    Log::Diag(1, "TRADE QueryClosedPosition: %d deals for posId=%lld", dealCount, positionId);
+
+    // Find the closing deal: look for the deal with closePositionDetail or the last FILLED deal
+    double foundClosePrice = 0.0;
+    double foundProfit = 0.0;
+    bool foundClose = false;
+
+    for (int i = dealCount - 1; i >= 0; i--) {
+        const char* deal = Protocol::GetArrayElement(arr, i);
+        if (!deal || !*deal) continue;
+
+        int execType = Protocol::ExtractInt(deal, "executionType");
+        // FILLED=3 or PARTIAL_FILL=11
+        if (execType != 3 && execType != 11) continue;
+
+        // Check for closePositionDetail — confirms this is the closing deal
+        const char* cpdStart = strstr(deal, "\"closePositionDetail\"");
+        if (cpdStart) {
+            const char* cpdObj = strchr(cpdStart, '{');
+            if (cpdObj) {
+                int md = Protocol::ExtractInt(cpdObj, "moneyDigits");
+                double scale = (md > 0) ? pow(10.0, (double)md) : pow(10.0, (double)G.moneyDigits);
+
+                long long grossRaw = Protocol::ExtractInt64(cpdObj, "grossProfit");
+                long long swapRaw = Protocol::ExtractInt64(cpdObj, "swap");
+                long long commRaw = Protocol::ExtractInt64(cpdObj, "commission");
+
+                foundProfit = ((double)grossRaw + (double)swapRaw + (double)commRaw) / scale;
+                foundClosePrice = Protocol::ExtractDouble(deal, "executionPrice");
+                foundClose = true;
+
+                Log::Info("TRADE", "QueryClosedPosition: found close deal price=%.5f NET=%.2f [server PnL]",
+                          foundClosePrice, foundProfit);
+                break;
+            }
+        }
+
+        // Fallback: use executionPrice from last FILLED deal
+        if (!foundClose) {
+            foundClosePrice = Protocol::ExtractDouble(deal, "executionPrice");
+            foundClose = true;
+        }
+    }
+
+    if (!foundClose) {
+        Log::Warn("TRADE", "QueryClosedPosition: no closing deal found for posId=%lld", positionId);
+        return false;
+    }
+
+    if (closePrice) *closePrice = foundClosePrice;
+    if (profit) *profit = foundProfit;
+    return true;
 }
 
 // ============================================================
