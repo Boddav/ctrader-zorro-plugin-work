@@ -5,6 +5,9 @@ namespace Account {
 // Request trader account info (balance, equity, etc.)
 bool RequestTraderInfo();
 
+// Refresh account info from server if stale (called from BrokerAccount main thread)
+bool RefreshAccountInfo();
+
 // Process TraderRes (2122)
 void HandleTraderRes(const char* buffer);
 

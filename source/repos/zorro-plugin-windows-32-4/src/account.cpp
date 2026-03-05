@@ -76,6 +76,7 @@ void HandleTraderRes(const char* buffer) {
         Log::Info("ACC", "Equity initialized from balance: %.2f", G.equity);
     }
 
+    G.accountRefreshMs = GetTickCount64();
     Log::Info("ACC", "Balance=%.2f moneyDigits=%d leverage=%lld (%.0f:1)",
               G.balance, G.moneyDigits, G.leverageInCents, (double)G.leverageInCents / 100.0);
 }
@@ -93,6 +94,7 @@ void HandleMarginChangedEvent(const char* buffer) {
     if (Protocol::HasField(buffer, "balance"))
         G.balance = (double)Protocol::ExtractInt64(buffer, "balance") / scale;
 
+    G.accountRefreshMs = GetTickCount64();
     Log::Info("ACC", "Margin: bal=%.2f eq=%.2f margin=%.2f free=%.2f",
               G.balance, G.equity, G.margin, G.freeMargin);
 }
@@ -108,6 +110,47 @@ void HandleTraderUpdateEvent(const char* buffer) {
     if (md > 0) {
         G.moneyDigits = md;
     }
+}
+
+// ============================================================
+// RefreshAccountInfo - get fresh balance/equity from server
+// Uses TraderReq (2121) / TraderRes (2122)
+// Called from MAIN THREAD (BrokerAccount), response forwarded by NetworkThread
+// ============================================================
+
+bool RefreshAccountInfo() {
+    if (!G.loggedIn || !WebSocket::IsConnected()) return false;
+
+    char payload[128];
+    sprintf_s(payload, "\"ctidTraderAccountId\":%lld", G.accountId);
+
+    const char* msg = Protocol::BuildMessage(Utils::NextMsgId(),
+                                             PayloadType::TraderReq, payload);
+
+    G.accountResponseReady = false;
+    G.waitingForAccount = true;
+
+    if (!WebSocket::Send(msg)) {
+        G.waitingForAccount = false;
+        Log::Warn("ACC", "RefreshAccountInfo send failed");
+        return false;
+    }
+
+    // Spin-wait for NetworkThread to deliver TraderRes (max 2s)
+    ULONGLONG start = GetTickCount64();
+    while (GetTickCount64() - start < 2000) {
+        if (G.accountResponseReady) {
+            G.waitingForAccount = false;
+            Log::Diag(1, "ACC refresh OK (%llums)", GetTickCount64() - start);
+            return true;
+        }
+        Sleep(10);
+        if (BrokerProgress) BrokerProgress(1);
+    }
+
+    G.waitingForAccount = false;
+    Log::Warn("ACC", "RefreshAccountInfo timeout (2s)");
+    return false;
 }
 
 } // namespace Account

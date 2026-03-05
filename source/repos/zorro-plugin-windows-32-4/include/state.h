@@ -157,6 +157,9 @@ struct State {
     int moneyDigits = 2;
     long long leverageInCents = 0;  // from TraderRes: 50000 = 500:1
     long long depositAssetId = 0;   // from TraderRes: account deposit currency asset ID
+    ULONGLONG accountRefreshMs = 0;  // last TraderReq/MarginChangedEvent timestamp (GetTickCount64)
+    volatile bool waitingForAccount = false;   // main thread waiting for TraderRes (2122)
+    volatile bool accountResponseReady = false; // NetworkThread signals TraderRes arrived
 
     // Diagnostics
     int diagLevel = 0;

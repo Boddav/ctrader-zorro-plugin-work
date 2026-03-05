@@ -342,6 +342,11 @@ static unsigned __stdcall NetworkThread(void* param) {
                 Log::Diag(2, "Heartbeat received");
                 break;
 
+            case ToInt(PayloadType::TraderRes):
+                Account::HandleTraderRes(buffer);
+                if (G.waitingForAccount) G.accountResponseReady = true;
+                break;
+
             case ToInt(PayloadType::ReconcileRes):
                 Trading::HandleReconcileRes(buffer);
                 break;
@@ -826,27 +831,36 @@ DLLFUNC int BrokerAccount(char* Account, double* pBalance, double* pTradeVal,
                           double* pMarginVal) {
     if (!G.loggedIn) return 0;
 
+    // Active refresh: re-query server balance/equity if stale (>10s)
+    ULONGLONG now = GetTickCount64();
+    if (G.accountRefreshMs == 0 || (now - G.accountRefreshMs) > 10000) {
+        Account::RefreshAccountInfo();
+    }
+
     if (pBalance) *pBalance = G.balance;
 
     if (pTradeVal) {
-        // Unrealized PnL from server cache (Zorro-opened trades only)
-        // Refresh cache if stale (>5 seconds)
-        ULONGLONG now = GetTickCount64();
+        // Unrealized PnL for ALL positions (Zorro + external strategies)
+        // Primary: server equity from MarginChangedEvent (2141) / TraderReq (2121)
+        // Fallback: sum ALL pnlCache entries from GetPosUnrealizedPnLReq (2187)
+
+        // Also refresh PnL cache if stale (>5s)
         if (G.pnlCacheTimeMs == 0 || (now - G.pnlCacheTimeMs) > 5000) {
             Trading::RefreshUnrealizedPnL();
         }
 
-        double totalPnL = 0.0;
-        CsLock lock(G.csTrades);
-        for (auto& kv : G.trades) {
-            if (!kv.second.open || kv.second.positionId <= 0) continue;
-            if (kv.second.reconciled) continue;  // skip external positions
-            auto pnlIt = G.pnlCache.find(kv.second.positionId);
-            if (pnlIt != G.pnlCache.end()) {
-                totalPnL += pnlIt->second.net;
+        if (G.equity > 0.0 && G.balance > 0.0 && G.accountRefreshMs > 0) {
+            // Server equity includes ALL positions' net unrealized PnL
+            *pTradeVal = G.equity - G.balance;
+        } else {
+            // Fallback: sum ALL server PnL cache entries (all positions on account)
+            double totalPnL = 0.0;
+            CsLock lock(G.csTrades);
+            for (auto& kv : G.pnlCache) {
+                totalPnL += kv.second.net;
             }
+            *pTradeVal = totalPnL;
         }
-        *pTradeVal = totalPnL;
     }
 
     if (pMarginVal) {
