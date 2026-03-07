@@ -410,22 +410,22 @@ function run()
 			if(channelShort && mlShort > MLThresh && regime_ok && mlOK_S && !NumOpenShort)
 				enterShort();
 
-			// CH EXIT: decision tree (from MLDRIVEN — no HTTP needed)
+			// CH EXIT: decision tree (ATR-based thresholds)
 			// LONG exit
 			if(NumOpenLong > 0 && !sessionEnd)
 			{
 				int breakout = (price > EntryHigh);
-				var distToTarget = (EntryHigh - price) / PIP;
-				int atMiddle = (abs(price - RegLine) < 5 * PIP);
+				var distToTarget = EntryHigh - price;
+				int atMiddle = (abs(price - RegLine) < 0.1 * h1atr);
 				int momentumOK = (Close[0] > Close[1]);
 
 				if(breakout)
 				{
 					// Breakout up → hold (trend potential)
 				}
-				else if(atMiddle && !momentumOK && distToTarget <= 10)
+				else if(atMiddle && !momentumOK && distToTarget < 0.2 * h1atr)
 				{
-					printf("\n[CH-EXIT] %s LONG: middle+weak+no room (dist=%.0f)", assetCode, distToTarget);
+					printf("\n[CH-EXIT] %s LONG: middle+weak+no room", assetCode);
 					exitLong();
 				}
 			}
@@ -434,17 +434,17 @@ function run()
 			if(NumOpenShort > 0 && !sessionEnd)
 			{
 				int breakout = (price < EntryLow);
-				var distToTarget = (price - EntryLow) / PIP;
-				int atMiddle = (abs(price - RegLine) < 5 * PIP);
+				var distToTarget = price - EntryLow;
+				int atMiddle = (abs(price - RegLine) < 0.1 * h1atr);
 				int momentumOK = (Close[0] < Close[1]);
 
 				if(breakout)
 				{
 					// Breakout down → hold (trend potential)
 				}
-				else if(atMiddle && !momentumOK && distToTarget <= 10)
+				else if(atMiddle && !momentumOK && distToTarget < 0.2 * h1atr)
 				{
-					printf("\n[CH-EXIT] %s SHORT: middle+weak+no room (dist=%.0f)", assetCode, distToTarget);
+					printf("\n[CH-EXIT] %s SHORT: middle+weak+no room", assetCode);
 					exitShort();
 				}
 			}

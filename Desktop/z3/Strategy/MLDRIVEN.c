@@ -577,40 +577,40 @@ function run()
 		algo("CH");
 		int sessionEnd = (hr >= assetSessEnd[aIdx]);
 
-		// CH LONG exit decision
+		// CH LONG exit decision (ATR-based thresholds)
 		if(NumOpenLong > 0 && !sessionEnd)
 		{
 			int breakout = (price > EntryHigh);
-			var distToTarget = (EntryHigh - price) / PIP;
-			int atMiddle = (abs(price - RegLine) < 5 * PIP);
+			var distToTarget = EntryHigh - price;
+			int atMiddle = (abs(price - RegLine) < 0.1 * h4atr);
 			int momentumOK = (Close[0] > Close[1]);
 
 			if(breakout)
 			{
 				// Kitörés felfelé → tartjuk (trend lehetőség)
 			}
-			else if(atMiddle && !momentumOK && distToTarget <= 10)
+			else if(atMiddle && !momentumOK && distToTarget < 0.2 * h4atr)
 			{
-				printf("\n[CH-EXIT] %s LONG: middle+weak+no room (dist=%.0f)", assetCode, distToTarget);
+				printf("\n[CH-EXIT] %s LONG: middle+weak+no room (dist=%.1f atr=%.1f)", assetCode, distToTarget/PIP, h4atr/PIP);
 				exitLong();
 			}
 		}
 
-		// CH SHORT exit decision
+		// CH SHORT exit decision (ATR-based thresholds)
 		if(NumOpenShort > 0 && !sessionEnd)
 		{
 			int breakout = (price < EntryLow);
-			var distToTarget = (price - EntryLow) / PIP;
-			int atMiddle = (abs(price - RegLine) < 5 * PIP);
+			var distToTarget = price - EntryLow;
+			int atMiddle = (abs(price - RegLine) < 0.1 * h4atr);
 			int momentumOK = (Close[0] < Close[1]);
 
 			if(breakout)
 			{
 				// Kitörés lefelé → tartjuk (trend lehetőség)
 			}
-			else if(atMiddle && !momentumOK && distToTarget <= 10)
+			else if(atMiddle && !momentumOK && distToTarget < 0.2 * h4atr)
 			{
-				printf("\n[CH-EXIT] %s SHORT: middle+weak+no room (dist=%.0f)", assetCode, distToTarget);
+				printf("\n[CH-EXIT] %s SHORT: middle+weak+no room (dist=%.1f atr=%.1f)", assetCode, distToTarget/PIP, h4atr/PIP);
 				exitShort();
 			}
 		}
@@ -626,18 +626,17 @@ function run()
 		// SMA PARTIAL CLOSE: LIFO (largest lot first)
 		// =========================================
 		algo("SMA");
-		algo("SMA");
-		var partialPip = 30;
+		var partialThresh = 0.5 * h4atr; // ATR-based partial close threshold
 		if(layersLong[aIdx] > 1)
 		{
 			for(current_trades)
 			{
-				var tradePips = (price - TradePriceOpen) / PIP;
+				var tradeProfit = price - TradePriceOpen;
 				if(TradeIsLong && TradeLots >= layersLong[aIdx]
-					&& tradePips > partialPip)
+					&& tradeProfit > partialThresh)
 				{
-					printf("\n[PARTIAL] SMA LONG %s close layer=%d lots=%d pips=%.1f",
-						assetCode, layersLong[aIdx], (int)TradeLots, tradePips);
+					printf("\n[PARTIAL] SMA LONG %s close layer=%d profit=%.1fp atr=%.1fp",
+						assetCode, layersLong[aIdx], tradeProfit/PIP, h4atr/PIP);
 					exitTrade(ThisTrade);
 					layersLong[aIdx] = layersLong[aIdx] - 1;
 					break;
@@ -648,12 +647,12 @@ function run()
 		{
 			for(current_trades)
 			{
-				var tradePips = (TradePriceOpen - price) / PIP;
+				var tradeProfit = TradePriceOpen - price;
 				if(TradeIsShort && TradeLots >= layersShort[aIdx]
-					&& tradePips > partialPip)
+					&& tradeProfit > partialThresh)
 				{
-					printf("\n[PARTIAL] SMA SHORT %s close layer=%d lots=%d pips=%.1f",
-						assetCode, layersShort[aIdx], (int)TradeLots, tradePips);
+					printf("\n[PARTIAL] SMA SHORT %s close layer=%d profit=%.1fp atr=%.1fp",
+						assetCode, layersShort[aIdx], tradeProfit/PIP, h4atr/PIP);
 					exitTrade(ThisTrade);
 					layersShort[aIdx] = layersShort[aIdx] - 1;
 					break;
