@@ -722,12 +722,8 @@ function run()
 		if(NumOpenShort == 0) layersShort[aIdx] = 0;
 
 		var baseMargin = Equity * 0.5 / 100.0 / numActiveAssets;
-		var minMargin = 50; // minimum $50 margin per trade
-		int marginOK = (baseMargin >= minMargin);
-		if(!marginOK && Bar % 5000 == 0)
-			printf("\n[MARGIN] %s too small: %.1f < %.0f — exits only", assetCode, baseMargin, minMargin);
 
-		if(marginOK && smaOK_L && smaFilterL && layersLong[aIdx] == 0
+		if(smaOK_L && smaFilterL && layersLong[aIdx] == 0
 			&& (Bar - lastLayerBarL[aIdx]) >= addCooldown)
 		{
 			Margin = baseMargin;
@@ -739,7 +735,7 @@ function run()
 			lastLayerBarL[aIdx] = Bar;
 			printf("\n[ENTRY] SMA LONG %s @ %.5f layer=1", assetCode, price);
 		}
-		else if(marginOK && smaAddL)
+		else if(smaAddL)
 		{
 			Margin = baseMargin * (layersLong[aIdx] + 1);
 			Stop = h4atr * smaStop;
@@ -751,7 +747,7 @@ function run()
 			printf("\n[ADD] SMA LONG %s @ %.5f layer=%d", assetCode, price, layersLong[aIdx]);
 		}
 
-		if(marginOK && smaOK_S && smaFilterS && layersShort[aIdx] == 0
+		if(smaOK_S && smaFilterS && layersShort[aIdx] == 0
 			&& (Bar - lastLayerBarS[aIdx]) >= addCooldown)
 		{
 			Margin = baseMargin;
@@ -763,7 +759,7 @@ function run()
 			lastLayerBarS[aIdx] = Bar;
 			printf("\n[ENTRY] SMA SHORT %s @ %.5f layer=1", assetCode, price);
 		}
-		else if(marginOK && smaAddS)
+		else if(smaAddS)
 		{
 			Margin = baseMargin * (layersShort[aIdx] + 1);
 			Stop = h4atr * smaStop;
@@ -817,7 +813,7 @@ function run()
 		// CH ENTRY (fix lot, LifeTime, no overnight)
 		// =========================================
 		algo("CH");
-		if(marginOK && chOK_L && chFilterL && NumOpenLong < 2 && !sessionEnd)
+		if(chOK_L && chFilterL && NumOpenLong < 2 && !sessionEnd)
 		{
 			Margin = baseMargin;
 			Stop = h4atr * chStop;
@@ -826,7 +822,7 @@ function run()
 			printf("\n[ENTRY] CH LONG %s @ %.5f", assetCode, price);
 		}
 
-		if(marginOK && chOK_S && chFilterS && NumOpenShort < 2 && !sessionEnd)
+		if(chOK_S && chFilterS && NumOpenShort < 2 && !sessionEnd)
 		{
 			Margin = baseMargin;
 			Stop = h4atr * chStop;
