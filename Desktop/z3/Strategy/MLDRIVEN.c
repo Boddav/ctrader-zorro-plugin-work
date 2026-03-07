@@ -723,7 +723,27 @@ function run()
 
 		var baseMargin = Equity * 0.5 / 100.0 / numActiveAssets;
 
-		if(smaOK_L && smaFilterL && layersLong[aIdx] == 0
+		// Margin safety: ne nyisson újat ha equity túl alacsony (stopout védelem)
+		var usedMargin = MarginTotal;
+		var freeMargin = Equity - usedMargin;
+		var marginLevel = 0;
+		if(usedMargin > 0) marginLevel = Equity / usedMargin * 100;
+		int safeToOpen = 1;
+		// Ha margin level < 200% VAGY free margin < baseMargin × 3 → ne nyiss
+		if(usedMargin > 0 && marginLevel < 200)
+		{
+			safeToOpen = 0;
+			if(Bar % 2000 == 0)
+				printf("\n[SAFETY] %s margin level %.0f%% < 200%% — no new trades", assetCode, marginLevel);
+		}
+		if(freeMargin < baseMargin * 3)
+		{
+			safeToOpen = 0;
+			if(Bar % 2000 == 0)
+				printf("\n[SAFETY] %s free margin %.0f < %.0f — no new trades", assetCode, freeMargin, baseMargin * 3);
+		}
+
+		if(safeToOpen && smaOK_L && smaFilterL && layersLong[aIdx] == 0
 			&& (Bar - lastLayerBarL[aIdx]) >= addCooldown)
 		{
 			Margin = baseMargin;
@@ -735,7 +755,7 @@ function run()
 			lastLayerBarL[aIdx] = Bar;
 			printf("\n[ENTRY] SMA LONG %s @ %.5f layer=1", assetCode, price);
 		}
-		else if(smaAddL)
+		else if(safeToOpen && smaAddL)
 		{
 			Margin = baseMargin * (layersLong[aIdx] + 1);
 			Stop = h4atr * smaStop;
@@ -747,7 +767,7 @@ function run()
 			printf("\n[ADD] SMA LONG %s @ %.5f layer=%d", assetCode, price, layersLong[aIdx]);
 		}
 
-		if(smaOK_S && smaFilterS && layersShort[aIdx] == 0
+		if(safeToOpen && smaOK_S && smaFilterS && layersShort[aIdx] == 0
 			&& (Bar - lastLayerBarS[aIdx]) >= addCooldown)
 		{
 			Margin = baseMargin;
@@ -759,7 +779,7 @@ function run()
 			lastLayerBarS[aIdx] = Bar;
 			printf("\n[ENTRY] SMA SHORT %s @ %.5f layer=1", assetCode, price);
 		}
-		else if(smaAddS)
+		else if(safeToOpen && smaAddS)
 		{
 			Margin = baseMargin * (layersShort[aIdx] + 1);
 			Stop = h4atr * smaStop;
@@ -813,7 +833,7 @@ function run()
 		// CH ENTRY (fix lot, LifeTime, no overnight)
 		// =========================================
 		algo("CH");
-		if(chOK_L && chFilterL && NumOpenLong < 2 && !sessionEnd)
+		if(safeToOpen && chOK_L && chFilterL && NumOpenLong < 2 && !sessionEnd)
 		{
 			Margin = baseMargin;
 			Stop = h4atr * chStop;
@@ -822,7 +842,7 @@ function run()
 			printf("\n[ENTRY] CH LONG %s @ %.5f", assetCode, price);
 		}
 
-		if(chOK_S && chFilterS && NumOpenShort < 2 && !sessionEnd)
+		if(safeToOpen && chOK_S && chFilterS && NumOpenShort < 2 && !sessionEnd)
 		{
 			Margin = baseMargin;
 			Stop = h4atr * chStop;
