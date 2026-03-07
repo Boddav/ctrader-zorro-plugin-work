@@ -17,10 +17,17 @@
 // Server: TENSORFLOWMODEL.py serve (port 5001)
 // =================================================================
 
-#define NUM_ASSETS 3
+#define NUM_ASSETS 7
 #define MAX_LAYERS 4
 #define ML_URL_PREDICT "http://127.0.0.1:5001/predict"
 #define ML_URL_FILTER  "http://127.0.0.1:5001/filter"
+#define ML_URL_VOTE    "http://127.0.0.1:5001/algo_vote"
+
+// Asset config from CSV
+static int assetActive[NUM_ASSETS];
+static int assetSessStart[NUM_ASSETS];
+static int assetSessEnd[NUM_ASSETS];
+static int numActiveAssets;
 
 // ML-predicted params per asset (12 params: 6 SMA + 6 CH)
 static int mlSmaTF[NUM_ASSETS];
@@ -37,6 +44,8 @@ static int mlAdxCH[NUM_ASSETS];
 static int mlMmiCH[NUM_ASSETS];
 static int mlReady[NUM_ASSETS];
 static int lastPredictHour[NUM_ASSETS];
+static int mlAlgoVote[NUM_ASSETS];
+static int lastVoteHour[NUM_ASSETS];
 static int lastFilterCloseHour[NUM_ASSETS];
 static int lastChFilterHour[NUM_ASSETS];
 
@@ -73,12 +82,80 @@ function run()
 	StopFactor = 1.5;
 
 	var RiskSlider = slider(1, 10, 5, 30, "Risk%x10", "Risk % x10 (10=1.0%)") / 10.0;
-	int algoMode = slider(2, 1, 1, 3, "Algo", "1=Both 2=SMA 3=CH");
+	int algoMode = slider(2, 1, 1, 4, "Algo", "1=Both 2=SMA 3=CH 4=Auto");
 	int ftmoMode = slider(3, 1, 1, 3, "FTMO", "1=Off 2=1-Step 3=2-Step");
 
 	if(is(INITRUN))
 	{
+		// Load asset config from CSV
+		numActiveAssets = 0;
 		int k;
+		for(k = 0; k < NUM_ASSETS; k++)
+		{
+			assetActive[k] = 0;
+			assetSessStart[k] = 7;
+			assetSessEnd[k] = 20;
+		}
+
+		string csv = file_content("Strategy\\MLDRIVEN_Assets.csv");
+		if(csv)
+		{
+			// Known asset order — parse each from CSV
+			string assetNames[7];
+			assetNames[0] = "EUR/USD";
+			assetNames[1] = "GBP/USD";
+			assetNames[2] = "USD/JPY";
+			assetNames[3] = "USD/CAD";
+			assetNames[4] = "XAU/USD";
+			assetNames[5] = "AUD/USD";
+			assetNames[6] = "EUR/CHF";
+
+			for(k = 0; k < NUM_ASSETS; k++)
+			{
+				char* line = strstr(csv, assetNames[k]);
+				if(line)
+				{
+					// Skip Asset name → find Code comma
+					char* p = strchr(line, ',');
+					if(p)
+					{
+						// Skip Code → find Active comma
+						p = strchr(p + 1, ',');
+						if(p)
+						{
+							assetActive[k] = atoi(p + 1);
+							if(assetActive[k]) numActiveAssets = numActiveAssets + 1;
+							// Skip Active → find SessionStart comma
+							p = strchr(p + 1, ',');
+							if(p)
+							{
+								assetSessStart[k] = atoi(p + 1);
+								// Skip SessionStart → find SessionEnd comma
+								p = strchr(p + 1, ',');
+								if(p)
+									assetSessEnd[k] = atoi(p + 1);
+							}
+						}
+					}
+				}
+			}
+			printf("\n[CSV] Loaded MLDRIVEN_Assets.csv: %d active assets", numActiveAssets);
+			for(k = 0; k < NUM_ASSETS; k++)
+			{
+				if(assetActive[k])
+					printf("\n  [%d] %s session %d-%d", k, assetNames[k], assetSessStart[k], assetSessEnd[k]);
+			}
+		}
+		else
+		{
+			printf("\n[CSV] MLDRIVEN_Assets.csv NOT FOUND — using defaults (3 assets)");
+			assetActive[0] = 1; assetActive[1] = 1; assetActive[2] = 1;
+			assetSessStart[0] = 7;  assetSessEnd[0] = 20;
+			assetSessStart[1] = 7;  assetSessEnd[1] = 20;
+			assetSessStart[2] = 1;  assetSessEnd[2] = 16;
+			numActiveAssets = 3;
+		}
+
 		for(k = 0; k < NUM_ASSETS; k++)
 		{
 			mlSmaTF[k] = 4;
@@ -97,6 +174,8 @@ function run()
 			lastPredictHour[k] = -1;
 			lastFilterCloseHour[k] = -1;
 			lastChFilterHour[k] = -1;
+			mlAlgoVote[k] = 1;
+			lastVoteHour[k] = -1;
 			layersLong[k] = 0;
 			layersShort[k] = 0;
 			lastLayerBarL[k] = 0;
@@ -173,13 +252,19 @@ function run()
 		// If stopped → close all and skip trading
 		if(ftmoStopped)
 		{
-			// Close everything
-			asset("EUR/USD"); algo("SMA"); exitLong(); exitShort();
-			algo("CH"); exitLong(); exitShort();
-			asset("GBP/USD"); algo("SMA"); exitLong(); exitShort();
-			algo("CH"); exitLong(); exitShort();
-			asset("USD/JPY"); algo("SMA"); exitLong(); exitShort();
-			algo("CH"); exitLong(); exitShort();
+			// Close everything (all active assets)
+			string allAssets[7];
+			allAssets[0] = "EUR/USD"; allAssets[1] = "GBP/USD"; allAssets[2] = "USD/JPY";
+			allAssets[3] = "USD/CAD"; allAssets[4] = "XAU/USD"; allAssets[5] = "AUD/USD";
+			allAssets[6] = "EUR/CHF";
+			int fa;
+			for(fa = 0; fa < NUM_ASSETS; fa++)
+			{
+				if(!assetActive[fa]) continue;
+				asset(allAssets[fa]);
+				algo("SMA"); exitLong(); exitShort();
+				algo("CH"); exitLong(); exitShort();
+			}
 
 			// Reset next day
 			if(today != ftmoLastDay || dailyLoss < dailyLossLimit * 0.5)
@@ -203,16 +288,21 @@ function run()
 				equity, dailyLoss, dailyLossLimit, totalLoss, maxLossLimit, ftmoHighBalance);
 	}
 
-	while(asset(loop("EUR/USD", "GBP/USD", "USD/JPY")))
+	while(asset(loop("EUR/USD", "GBP/USD", "USD/JPY",
+		"USD/CAD", "XAU/USD", "AUD/USD", "EUR/CHF")))
 	{
 		int aIdx = 0;
 		string assetCode = "EURUSD";
 		if(strstr(Asset, "EUR/USD"))      { aIdx = 0; assetCode = "EURUSD"; }
 		else if(strstr(Asset, "GBP/USD")) { aIdx = 1; assetCode = "GBPUSD"; }
 		else if(strstr(Asset, "USD/JPY")) { aIdx = 2; assetCode = "USDJPY"; }
+		else if(strstr(Asset, "USD/CAD")) { aIdx = 3; assetCode = "USDCAD"; }
+		else if(strstr(Asset, "XAU/USD")) { aIdx = 4; assetCode = "XAUUSD"; }
+		else if(strstr(Asset, "AUD/USD")) { aIdx = 5; assetCode = "AUDUSD"; }
+		else if(strstr(Asset, "EUR/CHF")) { aIdx = 6; assetCode = "EURCHF"; }
 
 		// =========================================
-		// SHARED INDICATORS
+		// SHARED INDICATORS — ALL series() BEFORE any continue!
 		// =========================================
 		TimeFrame = 1;
 		vars Close = series(priceClose());
@@ -251,6 +341,9 @@ function run()
 		vars SMA_S = series(SMA(Close, SlowMA));
 		TimeFrame = 1;
 
+		// Skip inactive assets (from CSV) — AFTER series() for consistency!
+		if(!assetActive[aIdx]) continue;
+
 		// Channel params
 		int N = mlN[aIdx];
 		var Factor = mlFactor_x100[aIdx] / 100.0;
@@ -284,14 +377,10 @@ function run()
 		var EntryLow  = RegLine + LowDev  + Factor * (HighDev + LowDev);
 		var EntryHigh = RegLine + HighDev - Factor * (HighDev + LowDev);
 
-		// Session filter
+		// Session filter (from CSV)
 		int hr = hour();
 		int isRollover = (hr >= 21 && hr <= 22);
-		int sessionOK = 0;
-		if(strstr(Asset, "EUR/USD"))      sessionOK = (hr >= 7 && hr <= 20);
-		else if(strstr(Asset, "GBP/USD")) sessionOK = (hr >= 7 && hr <= 20);
-		else if(strstr(Asset, "USD/JPY")) sessionOK = (hr >= 1 && hr <= 16);
-		else sessionOK = 1;
+		int sessionOK = (hr >= assetSessStart[aIdx] && hr <= assetSessEnd[aIdx]);
 		if(isRollover) sessionOK = 0;
 
 		// Features for ML
@@ -385,6 +474,40 @@ function run()
 		if(ftmoStopped) continue;
 
 		// =========================================
+		// ALGO VOTE (Auto mode = 4)
+		// =========================================
+		int effectiveAlgo = algoMode;
+		if(algoMode == 4 && !Train)
+		{
+			int callVote = 0;
+			if(hr != lastVoteHour[aIdx])
+			{
+				if(is(TRADEMODE)) callVote = 1;
+				if(is(TESTMODE)) callVote = 1;
+			}
+			if(callVote)
+			{
+				lastVoteHour[aIdx] = hr;
+				char voteBuf[512];
+				sprintf(voteBuf,
+					"{\"features\":[%.4f,%.4f,%.6f,%.2f,%.4f,%.4f,%.2f,%.4f,%.4f,%.4f,%.4f,%.2f]}",
+					ATR_Pct, Range_Pct, Volatility, adx, Trend_Bias,
+					Trend_Quality, rsi, hurst, Return_20, BB_Width,
+					WinRate, Current_State);
+				string voteResp = http_transfer(ML_URL_VOTE, voteBuf);
+				if(voteResp)
+				{
+					char* vp = strstr(voteResp, "algo_mode");
+					if(vp) { vp = strchr(vp, ':'); if(vp) mlAlgoVote[aIdx] = clamp((int)atof(vp+1), 0, 3); }
+					if(Bar % 2000 == 0)
+						printf("\n[VOTE] %s algo=%d", assetCode, mlAlgoVote[aIdx]);
+				}
+			}
+			effectiveAlgo = mlAlgoVote[aIdx];
+			if(effectiveAlgo == 0) { continue; }
+		}
+
+		// =========================================
 		// FCFS CHECK
 		// =========================================
 		algo("SMA");
@@ -403,8 +526,8 @@ function run()
 		int smaShortSig = crossUnder(SMA_F, SMA_S);
 		int smaTrendL = (SMA_F[0] > SMA_S[0]);
 		int smaTrendS = (SMA_F[0] < SMA_S[0]);
-		int smaEnabled = (algoMode == 1 || algoMode == 2);
-		int chEnabled  = (algoMode == 1 || algoMode == 3);
+		int smaEnabled = (effectiveAlgo == 1 || effectiveAlgo == 2);
+		int chEnabled  = (effectiveAlgo == 1 || effectiveAlgo == 3);
 		int smaOK_L = (smaEnabled && smaLongSig && rsi > 45 && rsi < 70 && smaRegime && smaCanOpen);
 		int smaOK_S = (smaEnabled && smaShortSig && rsi < 55 && rsi > 30 && smaRegime && smaCanOpen);
 		int addCooldown = 12;
@@ -452,9 +575,7 @@ function run()
 		// CH EXIT: decision tree + session end
 		// =========================================
 		algo("CH");
-		int sessionEnd = 0;
-		if(aIdx == 0 || aIdx == 1) sessionEnd = (hr >= 20);
-		if(aIdx == 2) sessionEnd = (hr >= 16);
+		int sessionEnd = (hr >= assetSessEnd[aIdx]);
 
 		// CH LONG exit decision
 		if(NumOpenLong > 0 && !sessionEnd)
@@ -735,7 +856,8 @@ function run()
 
 	if(is(EXITRUN))
 	{
-		printf("\n\n=== ML-DRIVEN v6: algo() + FCFS + TimeFrame + Smart Exit ===");
+		printf("\n\n=== ML-DRIVEN v7: algo() + FCFS + Asset CSV + Smart Exit ===");
+		printf("\nAssets: %d active (from MLDRIVEN_Assets.csv)", numActiveAssets);
 		printf("\nSMA: trend-following, pyramid, crossover exit, overnight OK");
 		printf("\nCH:  mean-reversion, fix lot, session exit, NO overnight");
 		printf("\nFCFS: one algo active, other waits");

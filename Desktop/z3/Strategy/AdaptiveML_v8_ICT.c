@@ -1,46 +1,40 @@
 // ===================================================================
-// ADAPTIVE ML v8 — M15 Channel + PERCEPTRON + XGBoost + Smart Exit
+// ADAPTIVE ML v8+ICT — v8 alap + 6 ICT feature teszt
 // ===================================================================
-// 7 assets (XAG/USD, USD/CHF kivéve — PF 0.36, 0.67)
+// CEL: Megvizsgalni hogy az ICT feature-ok (FVG, OTE, Sweep, BOS,
+// Displacement) javitjak-e a v8 PERCEPTRON+WFO teljesitmenyet.
 //
-// 5-LAYER FILTER + ONLINE LEARNING:
-//   1. LinReg Channel boundary (price < EntryLow / > EntryHigh)
-//   2. PERCEPTRON ML (WFO trained, 10 features)
-//   3. Regime filter (ADX + MMI optimized)
-//   4. XGBoost HTTP (external Python model, daily retrained)
-//   5. PHANTOM equity curve filter (per-asset)
+// VALTOZAS v8-hoz kepest:
+//   - 10 feature → 16 feature (+ fvgBull, fvgBear, ote, disp, sweep, bos)
+//   - PERCEPTRON 16 inputtal fut
+//   - Minden mas AZONOS: WFO, Regime, Smart Exit, Channel logic
 //
-// WORKFLOW:
-//   1. Export: AdaptiveML_v8_export [Test] → CSV + auto train+server
-//   2. Train mode: PERCEPTRON WFO training
-//   3. Test/Live: 5-layer filter + continuous feedback
-//
-// XGBoost szerver: Strategy/xgb_server.py (Flask, port 5000)
+// TESZT: [Train] majd [Test] → PF osszehasonlitas v8-cal
 // ===================================================================
 
 #define NUM_ASSETS 7
-#define NUM_FEATURES 10
-// No phantom lifetime — exit by stop loss or channel reversal
+#define NUM_FEATURES 16
 
-// Per-asset phantom outcome tracking
-static var phEntry[NUM_ASSETS];           // entry price
-static int phDir[NUM_ASSETS];             // 1=long, -1=short, 0=none
-static int phBars[NUM_ASSETS];            // bars since entry
-static var phFeats[70]; // 7 assets × 10 features
-static int lastDay;                       // for day-change detection
+static var phEntry[NUM_ASSETS];
+static int phDir[NUM_ASSETS];
+static int phBars[NUM_ASSETS];
+static var phFeats[112]; // 7 × 16
+static int lastDay;
 
-// Phantom equity curve filter — DISABLED (series consistency issue)
-// checkEquity() creates hidden LowPass series that are inconsistent
-// between Train and Test mode → "wrong series" error
-// TODO: fix by inlining ALL series/filter calls before continue
+function checkEquity()
+{
+	vars EquityCurve = series(EquityLong + EquityShort);
+	vars EquityLP = series(LowPass(EquityCurve, 10));
+	if(EquityLP[0] < LowPass(EquityLP, 100) && falling(EquityLP))
+		setf(TradeMode, TR_PHANTOM);
+	else
+		resf(TradeMode, TR_PHANTOM);
+}
 
 function run()
 {
-	// === TWO-STEP TRAINING (Slider 0 = "Period" slot) ===
-	// 1 = RULES only (PERCEPTRON) → _ml.c
-	// 2 = PARAMETERS only (optimize) → .par
-	// [Test]: mindkettőt betölti
-	int trainStep = slider(3, 1, 1, 2, "Step", "Train: 1=Rules 2=Params");
+	// === TWO-STEP TRAINING (like v8) ===
+	int trainStep = slider(0, 1, 1, 2, "Step", "Train: 1=Rules 2=Params");
 	if(Train)
 	{
 		if(trainStep == 1)
@@ -56,7 +50,7 @@ function run()
 	StartDate = 20200102;
 	EndDate = 20260301;
 
-	Capital = 2000;
+	Capital = 10000;
 	Leverage = 500;
 	Hedge = 2;
 	EndWeek = 52200;
@@ -73,25 +67,10 @@ function run()
 		brokerTrades(0);
 
 	// === SLIDERS (0-3 only!) ===
-	var MarginPct = slider(1, 2, 1, 10, "Margin%", "Equity % margin total");
-	var MLThresh  = slider(2, 0, -50, 50, "ML Thr", "PERCEPTRON threshold");
-	// Slider 3 = trainStep (defined at top of run())
-	var XGBThresh = 50; // fix — slider 3 used for trainStep
-	int UsePhantom = 0; // DISABLED — checkEquity series consistency issue
-
-	// === DAILY RETRAIN TRIGGER ===
-	if(!Train && (is(TRADEMODE) || is(TESTMODE)))
-	{
-		int today = day(0);
-		if(Bar > 0 && today != lastDay && dow(0) >= 1 && dow(0) <= 5)
-		{
-			if(hour(0) == 7)
-			{
-				http_transfer("http://127.0.0.1:5000/retrain", "{}");
-			}
-		}
-		lastDay = today;
-	}
+	// Slider 0 = trainStep (defined at top)
+	var MarginPct  = slider(1, 2, 1, 10, "Margin%", "Equity % margin total");
+	var MLThresh   = slider(2, 0, -50, 50, "ML Thr", "PERCEPTRON threshold");
+	var XGBThresh  = slider(3, 0, 0, 80, "XGB%", "XGBoost min score (test only)");
 
 	// === MULTI-ASSET LOOP ===
 	while(asset(loop(
@@ -99,7 +78,6 @@ function run()
 		"USD/CAD", "XAU/USD",
 		"AUD/USD", "EUR/CHF")))
 	{
-		// Per-asset ML model via algo()
 		string assetCode = "UNKNOWN";
 		int aIdx = 0;
 		if(strstr(Asset, "EUR/USD"))      { algo("EU"); assetCode = "EURUSD"; aIdx = 0; }
@@ -111,9 +89,12 @@ function run()
 		else if(strstr(Asset, "EUR/CHF")) { algo("EC"); assetCode = "EURCHF"; aIdx = 6; }
 
 		// ============================================================
-		// M15 INDICATORS
+		// OHLC + INDICATORS
 		// ============================================================
 		vars Close = series(priceClose());
+		vars Open  = series(priceOpen());
+		vars High  = series(priceHigh());
+		vars Low   = series(priceLow());
 		var price = Close[0];
 
 		var rsi = RSI(Close, 14);
@@ -125,19 +106,17 @@ function run()
 		var hh4 = HH(4);
 		var ll4 = LL(4);
 
-		// H1 ATR (TimeFrame=4 on M15 = H1)
+		// H1 ATR
 		TimeFrame = 4;
 		vars H1Close = series(priceClose());
 		var h1atr = ATR(14);
 		TimeFrame = 1;
 
-		// Structure indicators
+		// Structure
 		var hurst = Hurst(Close, 100);
 		if(hurst != hurst) hurst = 0.5;
-
 		var fracDim = FractalDimension(Close, 100);
 		if(fracDim != fracDim) fracDim = 1.5;
-
 		var spearman = Spearman(Close, 20);
 		if(spearman != spearman) spearman = 0;
 
@@ -152,7 +131,7 @@ function run()
 		int regime_ok = (adx > adxThresh && mmiVal < mmiThresh);
 
 		// ============================================================
-		// LINREG CHANNEL
+		// LINREG CHANNEL (same as v8)
 		// ============================================================
 		int N = 60; // HARDCODED — feature consistency for two-step training
 		var Slope = LinearRegSlope(Close, N);
@@ -182,10 +161,9 @@ function run()
 		if(ChannelWidth > 0)
 			chanPos = 100.0 * (price - (RegLine + LowDev)) / ChannelWidth;
 
-		// Session filter + Rollover block
+		// Session filter
 		int hr = hour();
 		int isRollover = (hr >= 21 && hr <= 22);
-
 		int sessionOK = 0;
 		if(strstr(Asset, "EUR/USD"))      sessionOK = (hr >= 7 && hr <= 20);
 		else if(strstr(Asset, "GBP/USD")) sessionOK = (hr >= 7 && hr <= 20);
@@ -195,14 +173,12 @@ function run()
 		else if(strstr(Asset, "AUD/USD")) sessionOK = (hr >= 1 && hr <= 16);
 		else if(strstr(Asset, "EUR/CHF")) sessionOK = (hr >= 7 && hr <= 20);
 		else sessionOK = 1;
-
 		if(isRollover) sessionOK = 0;
 
-		// Skip flag — minimum h1atr és channel width
-		int skipBar = (price == 0 || h1atr < PIP * 5 || ChannelWidth < PIP * 3);
+		int skipBar = (price == 0 || h1atr <= 0 || ChannelWidth <= 0);
 
 		// ============================================================
-		// 10 ML FEATURES [-1..+1]
+		// 16 FEATURES — v8 eredeti 10 + 6 ICT
 		// ============================================================
 		var chg1 = 0, chg4 = 0;
 		if(price > 0)
@@ -215,6 +191,9 @@ function run()
 		if(chanPos != chanPos) chanPos = 50;
 
 		var Sigs[NUM_FEATURES];
+		int j, k;
+
+		// --- v8 original 10 features ---
 		Sigs[0] = clamp((chanPos - 50) / 50.0, -1, 1);
 		Sigs[1] = clamp(Slope / (PIP + 0.00001), -1, 1);
 		Sigs[2] = clamp(ChannelWidth / (h1atr + 0.00001) / 10.0, -1, 1);
@@ -226,18 +205,117 @@ function run()
 		Sigs[8] = clamp((fracDim - 1.5) * 4.0, -1, 1);
 		Sigs[9] = clamp(spearman, -1, 1);
 
-		// PERCEPTRON prediction (MINDIG hívni!)
+		// --- 6 ICT features ---
+
+		// [10] FVG BULL — legközelebbi bullish FVG távolsága
+		var nearBullFVG = 5.0;
+		for(k = 1; k <= 15; k++)
+		{
+			if(High[k+2] < Low[k])
+			{
+				var gapMid = (Low[k] + High[k+2]) / 2.0;
+				var d = abs(price - gapMid) / (h1atr + PIP);
+				if(d < nearBullFVG) nearBullFVG = d;
+			}
+		}
+		Sigs[10] = clamp(1.0 - nearBullFVG, -1, 1);
+
+		// [11] FVG BEAR — legközelebbi bearish FVG távolsága
+		var nearBearFVG = 5.0;
+		for(k = 1; k <= 15; k++)
+		{
+			if(Low[k+2] > High[k])
+			{
+				var gapMid = (High[k] + Low[k+2]) / 2.0;
+				var d = abs(price - gapMid) / (h1atr + PIP);
+				if(d < nearBearFVG) nearBearFVG = d;
+			}
+		}
+		Sigs[11] = clamp(1.0 - nearBearFVG, -1, 1);
+
+		// [12] OTE — Optimal Trade Entry (Fib 0.618-0.786 zóna)
+		var swHigh = HH(20);
+		var swLow = LL(20);
+		var swRange = swHigh - swLow;
+		var slope20 = LinearRegSlope(Close, 20);
+		if(slope20 != slope20) slope20 = 0;
+
+		Sigs[12] = 0;
+		if(swRange > PIP * 5)
+		{
+			if(slope20 > 0)
+			{
+				var fib618 = swHigh - 0.618 * swRange;
+				var fib786 = swHigh - 0.786 * swRange;
+				if(price >= fib786 && price <= fib618) Sigs[12] = 1.0;
+			}
+			if(slope20 < 0)
+			{
+				var fib618 = swLow + 0.618 * swRange;
+				var fib786 = swLow + 0.786 * swRange;
+				if(price >= fib618 && price <= fib786) Sigs[12] = -1.0;
+			}
+		}
+
+		// [13] DISPLACEMENT — erős gyertatest + méret
+		var cRange = High[0] - Low[0];
+		if(cRange <= 0) cRange = PIP;
+		var cBody = abs(Close[0] - Open[0]);
+		var bodyRatio = cBody / cRange;
+
+		Sigs[13] = 0;
+		if(bodyRatio > 0.7 && cRange > 0.3 * h1atr)
+		{
+			var strength = cRange / (h1atr + PIP);
+			if(Close[0] > Open[0])
+				Sigs[13] = clamp(strength, 0, 1);
+			else
+				Sigs[13] = clamp(-strength, -1, 0);
+		}
+
+		// [14] SWEEP — liquidity grab (wick alá/fölé megy majd visszajön)
+		var prevHH = High[1];
+		var prevLL = Low[1];
+		for(k = 2; k <= 15; k++)
+		{
+			if(High[k] > prevHH) prevHH = High[k];
+			if(Low[k] < prevLL) prevLL = Low[k];
+		}
+		Sigs[14] = 0;
+		if(Low[0] < prevLL && Close[0] > prevLL)
+			Sigs[14] = clamp((prevLL - Low[0]) / (h1atr + PIP), 0, 1);
+		if(High[0] > prevHH && Close[0] < prevHH)
+			Sigs[14] = clamp(-(High[0] - prevHH) / (h1atr + PIP), -1, 0);
+
+		// [15] BOS — Break of Structure
+		var olderHH = High[10];
+		var olderLL = Low[10];
+		for(k = 11; k <= 20; k++)
+		{
+			if(High[k] > olderHH) olderHH = High[k];
+			if(Low[k] < olderLL) olderLL = Low[k];
+		}
+		var recentHH = HH(5);
+		var recentLL = LL(5);
+		int bosBull = (recentHH > olderHH);
+		int bosBear = (recentLL < olderLL);
+		Sigs[15] = 0;
+		if(bosBull && !bosBear) Sigs[15] = 1;
+		if(bosBear && !bosBull) Sigs[15] = -1;
+
+		// ============================================================
+		// PERCEPTRON — 16 features (v8 had 10)
+		// ============================================================
 		var mlLong  = adviseLong(PERCEPTRON+BALANCED+RETURNS, 0, Sigs, NUM_FEATURES);
 		var mlShort = adviseShort();
 
-		// optimize() MUST be before continue!
-		var stopMult = optimize(3.0, 1.5, 5.0, 0.5);
+		// Trade params — optimize() MUST be before continue for consistent param order!
+		var stopMult = optimize(3.0, 1.0, 5.0, 0.5);
 		int lifeTime = optimize(20, 10, 40, 5);
 
 		// === SKIP ===
 		if(skipBar || !sessionOK) continue;
 
-		// Trade params
 		Stop = h1atr * stopMult;
 		LifeTime = lifeTime;
 		Margin = Equity * MarginPct / 100.0 / NUM_ASSETS;
@@ -247,99 +325,16 @@ function run()
 		int channelShort = (price > EntryHigh);
 
 		// ============================================================
-		// PHANTOM OUTCOME TRACKING — online learning feedback
-		// ============================================================
-		if(!Train && (is(TRADEMODE) || is(TESTMODE)))
-		{
-			if(phDir[aIdx] != 0)
-			{
-				phBars[aIdx] = phBars[aIdx] + 1;
-
-				int phExit = 0;
-				var phUnreal = (price - phEntry[aIdx]) * phDir[aIdx];
-				// Stop loss: ATR × 3 (same as real trades)
-				if(phUnreal < -(h1atr * 3.0)) phExit = 1;
-				// Channel exit: only if in loss, min 5 bars
-				if(phBars[aIdx] >= 5 && phUnreal <= 0)
-				{
-					if(phDir[aIdx] == 1 && price > EntryHigh) phExit = 1;
-					if(phDir[aIdx] == -1 && price < EntryLow) phExit = 1;
-				}
-				// Stale trade: 60+ bars with no meaningful profit → close
-				if(phBars[aIdx] >= 60 && phUnreal < 5 * PIP) phExit = 1;
-
-				if(phExit)
-				{
-					var phPnl = (price - phEntry[aIdx]) * phDir[aIdx];
-					// Total cost: spread + commission + slippage (min 5 pips)
-					var totalCost = max(Spread, 5) * PIP;
-					var phNetPnl = phPnl - totalCost;
-					int phLabel = 0;
-					if(phNetPnl > 0) phLabel = 1;
-					// Convert to pips and dollars for log
-					var grossPips = phPnl / PIP;
-					var netPips = phNetPnl / PIP;
-					var phLots = Equity * MarginPct / 100.0 / NUM_ASSETS / (price * LotAmount / Leverage);
-					var phDollar = netPips * PIPCost * phLots;
-
-					printf("\n[PHANTOM] %s %s close @ %.5f entry %.5f %.1fp net %.1fp $%.1f %s bars=%d",
-						assetCode, ifelse(phDir[aIdx]==1,"LONG","SHORT"),
-						price, phEntry[aIdx], grossPips, netPips, phDollar,
-						ifelse(phLabel,"WIN","LOSS"), phBars[aIdx]);
-
-					int base = aIdx * NUM_FEATURES;
-					char fbData[512];
-					sprintf(fbData,
-						"{\"asset\":\"%s\",\"side\":%d,\"label\":%d,\"features\":[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]}",
-						assetCode, phDir[aIdx], phLabel,
-						phFeats[base+0], phFeats[base+1], phFeats[base+2],
-						phFeats[base+3], phFeats[base+4], phFeats[base+5],
-						phFeats[base+6], phFeats[base+7], phFeats[base+8],
-						phFeats[base+9]);
-					http_transfer("http://127.0.0.1:5000/feedback", fbData);
-
-					phDir[aIdx] = 0;
-				}
-			}
-
-			if(phDir[aIdx] == 0)
-			{
-				if(channelLong)
-				{
-					phEntry[aIdx] = price;
-					phDir[aIdx] = 1;
-					phBars[aIdx] = 0;
-					int base = aIdx * NUM_FEATURES;
-					int j;
-					for(j = 0; j < NUM_FEATURES; j++)
-						phFeats[base + j] = Sigs[j];
-					printf("\n[PHANTOM] %s LONG open @ %.5f", assetCode, price);
-				}
-				else if(channelShort)
-				{
-					phEntry[aIdx] = price;
-					phDir[aIdx] = -1;
-					phBars[aIdx] = 0;
-					int base = aIdx * NUM_FEATURES;
-					int j;
-					for(j = 0; j < NUM_FEATURES; j++)
-						phFeats[base + j] = Sigs[j];
-					printf("\n[PHANTOM] %s SHORT open @ %.5f", assetCode, price);
-				}
-			}
-		}
-
-		// ============================================================
-		// TRAIN MODE
+		// TRAIN MODE — channel + regime (WFO optimizes thresholds)
 		// ============================================================
 		if(Train)
 		{
-			if(channelLong)  enterLong();
-			if(channelShort) enterShort();
+			if(channelLong && regime_ok)  enterLong();
+			if(channelShort && regime_ok) enterShort();
 		}
 
 		// ============================================================
-		// TEST/LIVE MODE: PERCEPTRON + XGBoost + Phantom filter
+		// TEST/LIVE MODE: Channel + PERCEPTRON + Regime + XGBoost
 		// ============================================================
 		if(!Train)
 		{
@@ -353,16 +348,16 @@ function run()
 			else if(strstr(Asset, "AUD/USD")) sessionEnd = (hr >= 16);
 			else if(strstr(Asset, "EUR/CHF")) sessionEnd = (hr >= 20);
 
-			// XGBoost + Phantom prediction via HTTP
+			// XGBoost prediction (port 5000, 16 features)
 			var xgbLong = 50, xgbShort = 50;
-			var phLong = 50, phShort = 50;
 			if(is(TRADEMODE) || is(TESTMODE))
 			{
 				string postData = strf(
-					"{\"asset\":\"%s\",\"features\":[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]}",
+					"{\"asset\":\"%s\",\"features\":[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]}",
 					assetCode,
 					Sigs[0],Sigs[1],Sigs[2],Sigs[3],Sigs[4],
-					Sigs[5],Sigs[6],Sigs[7],Sigs[8],Sigs[9]);
+					Sigs[5],Sigs[6],Sigs[7],Sigs[8],Sigs[9],
+					Sigs[10],Sigs[11],Sigs[12],Sigs[13],Sigs[14],Sigs[15]);
 
 				string response = http_transfer("http://127.0.0.1:5000/predict", postData);
 				if(response)
@@ -379,35 +374,17 @@ function run()
 						pShort = strchr(pShort, ':');
 						if(pShort) xgbShort = atof(pShort + 1) * 100;
 					}
-					// Phantom model scores (learned from live phantom trades)
-					char* pPhL = strstr(response, "phantom_long");
-					char* pPhS = strstr(response, "phantom_short");
-					if(pPhL)
-					{
-						pPhL = strchr(pPhL, ':');
-						if(pPhL) phLong = atof(pPhL + 1) * 100;
-					}
-					if(pPhS)
-					{
-						pPhS = strchr(pPhS, ':');
-						if(pPhS) phShort = atof(pPhS + 1) * 100;
-					}
 				}
 			}
 
-			// ENTRY: Channel + PERCEPTRON + Regime + XGBoost OR Phantom override
 			int xgbOK_L = (xgbLong >= XGBThresh);
 			int xgbOK_S = (xgbShort >= XGBThresh);
-			// Phantom override: if XGBoost blocks but phantom model says >= 60%, allow trade
-			int phOK_L = (phLong >= 60);
-			int phOK_S = (phShort >= 60);
-			int mlOK_L = (xgbOK_L || phOK_L);
-			int mlOK_S = (xgbOK_S || phOK_S);
 
-			if(channelLong && mlLong > MLThresh && regime_ok && mlOK_L && !NumOpenLong)
+			// ENTRY: Channel + PERCEPTRON + Regime + XGBoost
+			if(channelLong && mlLong > MLThresh && regime_ok && xgbOK_L && !NumOpenLong)
 				enterLong();
 
-			if(channelShort && mlShort > MLThresh && regime_ok && mlOK_S && !NumOpenShort)
+			if(channelShort && mlShort > MLThresh && regime_ok && xgbOK_S && !NumOpenShort)
 				enterShort();
 
 			// CH EXIT: decision tree (from MLDRIVEN — no HTTP needed)
@@ -468,6 +445,11 @@ function run()
 			plot("ML_Short", mlShort,   0, RED);
 			plot("ADX",      adx,       NEW, ORANGE);
 			plot("MMI",      mmiVal,    0, MAGENTA);
+			plot("FVG_B",    Sigs[10]*50+50, NEW, CYAN);
+			plot("FVG_S",    Sigs[11]*50+50, 0, MAGENTA);
+			plot("OTE",      Sigs[12]*50+50, NEW, YELLOW);
+			plot("Sweep",    Sigs[14]*50+50, 0, WHITE);
+			plot("BOS",      Sigs[15]*50+50, 0, ORANGE);
 		}
 	}
 
@@ -477,15 +459,15 @@ function run()
 		printf("\n[BAR %d] Open=%d Eq=%.0f", Bar, NumOpenTotal, Equity);
 	if(is(EXITRUN))
 	{
-		printf("\n\n=== ADAPTIVE ML v8: M15 Channel+PERCEPTRON+XGBoost+SmartExit | 7 assets ===\n");
-		if(Train && trainStep == 2)
-		{
-			// .par fájlok másolása export néven
-			file_write("Data\\copy_v8_pars.bat",
-				"@echo off\r\ncopy /y \"Data\\AdaptiveML_v8.par\" \"Data\\AdaptiveML_v8_export.par\" >nul\r\nfor /L %%i in (1,1,8) do copy /y \"Data\\AdaptiveML_v8_%%i.par\" \"Data\\AdaptiveML_v8_export_%%i.par\" >nul 2>nul\r\n", 0);
-			//exec("cmd", "/c Data\\copy_v8_pars.bat", 0); // cmd ablak probléma — manuálisan kell
-			printf("\n>>> PARAMS KÉSZ! .par fájlok exportra másolva. <<<\n");
-		}
-		if(Train) printf("\nStep=%d (1=Rules 2=Params)\n", trainStep);
+		printf("\n\n=== ADAPTIVE ML v8+ICT FIXED: 16 features, two-step, 6yr data ===");
+		printf("\nWFO=%d DataSplit=%d", NumWFOCycles, DataSplit);
+		if(Train) printf("\nStep=%d (1=Rules 2=Params)", trainStep);
+		printf("\nPERCEPTRON+BALANCED+RETURNS, 16 features, N=60 Factor=0.20 hardcoded");
+		int totalTrades = NumWinTotal + NumLossTotal;
+		printf("\nTrades=%d Win=%d Loss=%d WR=%.1f%%",
+			totalTrades, NumWinTotal, NumLossTotal,
+			ifelse(totalTrades > 0, NumWinTotal * 100.0 / totalTrades, 0));
+		printf("\nProfit=%.0f Equity=%.0f\n",
+			WinTotal + LossTotal, Equity);
 	}
 }
