@@ -721,7 +721,14 @@ function run()
 		if(NumOpenLong == 0) layersLong[aIdx] = 0;
 		if(NumOpenShort == 0) layersShort[aIdx] = 0;
 
-		var baseMargin = Equity * 0.5 / 100.0 / NUM_ASSETS;
+		var baseMargin = Equity * 0.5 / 100.0 / numActiveAssets;
+		var minMargin = 50; // minimum $50 margin per trade
+		if(baseMargin < minMargin)
+		{
+			if(Bar % 5000 == 0)
+				printf("\n[SKIP] %s margin too small: %.1f < %.0f", assetCode, baseMargin, minMargin);
+			continue;
+		}
 
 		if(smaOK_L && smaFilterL && layersLong[aIdx] == 0
 			&& (Bar - lastLayerBarL[aIdx]) >= addCooldown)
@@ -815,7 +822,7 @@ function run()
 		algo("CH");
 		if(chOK_L && chFilterL && NumOpenLong < 2 && !sessionEnd)
 		{
-			Margin = Equity * 0.5 / 100.0 / NUM_ASSETS;
+			Margin = baseMargin;
 			Stop = h4atr * chStop;
 			LifeTime = 0;
 			enterLong();
@@ -824,7 +831,7 @@ function run()
 
 		if(chOK_S && chFilterS && NumOpenShort < 2 && !sessionEnd)
 		{
-			Margin = Equity * 0.5 / 100.0 / NUM_ASSETS;
+			Margin = baseMargin;
 			Stop = h4atr * chStop;
 			LifeTime = 0;
 			enterShort();
