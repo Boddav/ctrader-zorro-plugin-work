@@ -1,5 +1,5 @@
 // =================================================================
-// ML DATA COLLECTION v6 - algo() Separation + FCFS + TimeFrame
+// ML DATA COLLECTION v7 - 7 assets + algo() Separation + FCFS + TimeFrame
 //
 // TWO ALGOS: SMA (trend) + CH (mean-reversion)
 //   - Separate optimize() params per algo
@@ -10,9 +10,9 @@
 // Pipeline: [Train] -> WFO -> [Test] -> 2x CSV -> server trains
 // =================================================================
 
-#define NUM_ASSETS 3
+#define NUM_ASSETS 7
 #define MAX_LAYERS 4
-#define MAX_PHANTOM 20
+#define MAX_PHANTOM 40
 
 static var InitialBalance;
 static int lastLogDay[NUM_ASSETS];
@@ -32,7 +32,7 @@ static int phAsset[MAX_PHANTOM];
 static int phType[MAX_PHANTOM];
 static var phATR[MAX_PHANTOM];
 static var phStop[MAX_PHANTOM];
-static var phFeats[240];
+static var phFeats[480]; // 40 × 12
 
 function run()
 {
@@ -76,14 +76,19 @@ function run()
 		csvReady = 1;
 	}
 
-	// === MULTI-ASSET LOOP ===
-	while(asset(loop("EUR/USD", "GBP/USD", "USD/JPY")))
+	// === MULTI-ASSET LOOP (7 assets) ===
+	while(asset(loop("EUR/USD", "GBP/USD", "USD/JPY",
+		"USD/CAD", "XAU/USD", "AUD/USD", "EUR/CHF")))
 	{
 		int aIdx = 0;
 		string assetCode = "EURUSD";
 		if(strstr(Asset, "EUR/USD"))      { aIdx = 0; assetCode = "EURUSD"; }
 		else if(strstr(Asset, "GBP/USD")) { aIdx = 1; assetCode = "GBPUSD"; }
 		else if(strstr(Asset, "USD/JPY")) { aIdx = 2; assetCode = "USDJPY"; }
+		else if(strstr(Asset, "USD/CAD")) { aIdx = 3; assetCode = "USDCAD"; }
+		else if(strstr(Asset, "XAU/USD")) { aIdx = 4; assetCode = "XAUUSD"; }
+		else if(strstr(Asset, "AUD/USD")) { aIdx = 5; assetCode = "AUDUSD"; }
+		else if(strstr(Asset, "EUR/CHF")) { aIdx = 6; assetCode = "EURCHF"; }
 
 		// =========================================
 		// SMA ALGO PARAMS (6 optimize)
@@ -168,13 +173,17 @@ function run()
 		var EntryLow  = RegLine + LowDev  + Factor * (HighDev + LowDev);
 		var EntryHigh = RegLine + HighDev - Factor * (HighDev + LowDev);
 
-		// Session filter
+		// Session filter (7 assets)
 		int hr = hour();
 		int isRollover = (hr >= 21 && hr <= 22);
 		int sessionOK = 0;
 		if(strstr(Asset, "EUR/USD"))      sessionOK = (hr >= 7 && hr <= 20);
 		else if(strstr(Asset, "GBP/USD")) sessionOK = (hr >= 7 && hr <= 20);
 		else if(strstr(Asset, "USD/JPY")) sessionOK = (hr >= 1 && hr <= 16);
+		else if(strstr(Asset, "USD/CAD")) sessionOK = (hr >= 12 && hr <= 20);
+		else if(strstr(Asset, "XAU/USD")) sessionOK = (hr >= 7 && hr <= 20);
+		else if(strstr(Asset, "AUD/USD")) sessionOK = (hr >= 1 && hr <= 16);
+		else if(strstr(Asset, "EUR/CHF")) sessionOK = (hr >= 7 && hr <= 20);
 		else sessionOK = 1;
 		if(isRollover) sessionOK = 0;
 
@@ -356,8 +365,12 @@ function run()
 		// =========================================
 		algo("CH");
 		int sessionEnd = 0;
-		if(aIdx == 0 || aIdx == 1) sessionEnd = (hr >= 20);
-		if(aIdx == 2) sessionEnd = (hr >= 16);
+		if(aIdx == 0 || aIdx == 1) sessionEnd = (hr >= 20);  // EUR/USD, GBP/USD
+		if(aIdx == 2) sessionEnd = (hr >= 16);                // USD/JPY
+		if(aIdx == 3) sessionEnd = (hr >= 20);                // USD/CAD
+		if(aIdx == 4) sessionEnd = (hr >= 20);                // XAU/USD
+		if(aIdx == 5) sessionEnd = (hr >= 16);                // AUD/USD
+		if(aIdx == 6) sessionEnd = (hr >= 20);                // EUR/CHF
 		if(sessionEnd)
 		{
 			exitLong();
@@ -501,7 +514,7 @@ function run()
 
 	if(is(EXITRUN))
 	{
-		printf("\n\n=== ML DATA COLLECTION v6: algo() + FCFS + TimeFrame ===");
+		printf("\n\n=== ML DATA COLLECTION v7: 7 assets + algo() + FCFS + TimeFrame ===");
 		printf("\nSMA: %d optimize params (smaTF, FastMA, SlowMA, smaStop, adxSMA, mmiSMA)", 6);
 		printf("\nCH:  %d optimize params (N, Factor, chStop, lifeTime, adxCH, mmiCH)", 6);
 		printf("\nFCFS: First Come First Served (Test mode only)");
