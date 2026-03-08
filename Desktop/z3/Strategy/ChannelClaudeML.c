@@ -9,26 +9,22 @@
 
 function run()
 {
-	// === AUTO TWO-STEP TRAINING ===
-	// 1. [Train] → RULES (PERCEPTRON) → _ml.c + flag fájl
-	// 2. [Train] → PARAMETERS (optimize) → .par + flag törlés
-	// 3. [Train] → RULES megint (ciklikus)
-	// [Test]: mindkettőt betölti
-	int trainStep = 1;
+	// === TWO-STEP TRAINING (Slider 3) ===
+	// Slider 3 = 1: [Train] → RULES (PERCEPTRON) → _ml.c
+	// Slider 3 = 2: [Train] → PARAMETERS (optimize) → .par
+	// [Test]: mindkettőt betölti (RULES|PARAMETERS)
+	int trainStep = slider(3, 1, 1, 2, "Step", "1=Rules 2=Params");
+
 	if(Train)
 	{
-		if(file_date("Data\\ChannelClaudeML_step1_done"))
-			trainStep = 2;
 		if(trainStep == 1)
 		{
 			set(LOGFILE|PLOTNOW|RULES);
-			reset(PARAMETERS);
 			if(Bar == 0) printf("\n=== STEP 1: PERCEPTRON TRAINING ===\n");
 		}
 		else
 		{
 			set(LOGFILE|PLOTNOW|PARAMETERS);
-			reset(RULES);
 			if(Bar == 0) printf("\n=== STEP 2: PARAMETER OPTIMIZATION ===\n");
 		}
 	}
@@ -37,7 +33,7 @@ function run()
 
 	BarPeriod = 15;
 	LookBack = 300;
-	StartDate = 20240101;
+	StartDate = 20250101;
 	EndDate = 20260301;
 
 	Capital = 2000;
@@ -229,14 +225,8 @@ function run()
 	{
 		printf("\n\n=== CHANNEL CLAUDE ML v1: LinReg+PERCEPTRON ===\n");
 		if(Train && trainStep == 1)
-		{
-			file_write("Data\\ChannelClaudeML_step1_done", "1", 0);
-			printf("\n>>> Step 1 KÉSZ! Nyomd meg újra [Train] a Step 2-höz <<<\n");
-		}
+			printf("\n>>> Step 1 KÉSZ! Állítsd Slider 3 = 2, majd [Train] újra <<<\n");
 		if(Train && trainStep == 2)
-		{
-			file_delete("Data\\ChannelClaudeML_step1_done");
 			printf("\n>>> Step 2 KÉSZ! Mindkét lépés megvan. Nyomd meg [Test] <<<\n");
-		}
 	}
 }

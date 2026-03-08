@@ -17,8 +17,38 @@
 // Server: TENSORFLOWMODEL.py serve (port 5001)
 // =================================================================
 
+// ============ KONFIGURÁLHATÓ PARAMÉTEREK ============
+// Backtest & tőke
+#define CFG_BARPERIOD     5       // BarPeriod (perc): 1, 5, 15, 60
+#define CFG_STARTDATE     20260101 // Backtest kezdő dátum
+#define CFG_ENDDATE       20261018 // Backtest záró dátum
+#define CFG_CAPITAL       5000     // Kezdő tőke
+#define CFG_LEVERAGE      500      // Leverage
+#define CFG_STOPFACTOR    5.5      // StopFactor (globális)
+
+// SMA algo paraméterek
+#define SMA_MAX_LAYERS    4        // Pyramid max réteg szám
+#define SMA_COOLDOWN      12       // Bar-ok két layer között
+#define SMA_PARTIAL_ATR   0.5      // Partial close ATR szorzó
+
+// CH algo paraméterek
+#define CH_MAX_POS        2        // Max nyitott pozíció per irány
+#define CH_HEDGE          1       // 1=hedge (long+short), 0=netting
+
+// SMA hedge
+#define SMA_HEDGE         1        // 1=hedge (long+short), 0=netting
+
+// FTMO limitek (% a start balance-hoz képest)
+#define FTMO_DAILY_1STEP  0.03     // 1-Step daily loss limit (3%)
+#define FTMO_DAILY_2STEP  0.05     // 2-Step daily loss limit (5%)
+#define FTMO_MAX_LOSS     0.10     // Max loss limit (10%)
+#define FTMO_PROFIT_TARGET 0.10    // Profit target (10%)
+#define FTMO_BESTDAY_RULE 0.50     // Best Day Rule (50%)
+#define FTMO_RESUME_RATIO 0.50     // Napi limit feloldás küszöb (50%)
+// ====================================================
+
 #define NUM_ASSETS 7
-#define MAX_LAYERS 4
+#define MAX_LAYERS SMA_MAX_LAYERS
 #define ML_URL_PREDICT "http://127.0.0.1:5001/predict"
 #define ML_URL_FILTER  "http://127.0.0.1:5001/filter"
 #define ML_URL_VOTE    "http://127.0.0.1:5001/algo_vote"
@@ -57,6 +87,23 @@ static int lastLayerBarS[NUM_ASSETS];
 static int smaHasOpen[NUM_ASSETS];
 static int chHasOpen[NUM_ASSETS];
 
+// Phantom tracking (SKIP trade kiértékelés)
+#define PHANTOM_EVAL_BARS 50       // Hány bar múlva értékeljük ki
+static var  phSmaPrice[NUM_ASSETS]; // SMA SKIP belépési ár
+static int  phSmaDir[NUM_ASSETS];   // SMA SKIP irány (1=long, -1=short)
+static int  phSmaBar[NUM_ASSETS];   // SMA SKIP bar száma
+static int  phSmaLots[NUM_ASSETS];  // SMA SKIP lot méret
+static var  phChPrice[NUM_ASSETS];  // CH SKIP belépési ár
+static int  phChDir[NUM_ASSETS];    // CH SKIP irány
+static int  phChBar[NUM_ASSETS];    // CH SKIP bar száma
+static int  phChLots[NUM_ASSETS];   // CH SKIP lot méret
+static int  phSmaWin;               // összesített SKIP wins
+static int  phSmaLoss;              // összesített SKIP losses
+static var  phSmaPnl;               // összesített SKIP PnL ($)
+static int  phChWin;
+static int  phChLoss;
+static var  phChPnl;
+
 // FTMO tracking
 static var ftmoStartBalance;
 static var ftmoHighBalance;
@@ -70,20 +117,26 @@ function run()
 {
 	set(LOGFILE|PLOTNOW);
 
-	BarPeriod = 60;
+	BarPeriod = CFG_BARPERIOD;
 	LookBack = 900;
-	StartDate = 20200101;
-	EndDate = 20261018;
+	StartDate = CFG_STARTDATE;
+	EndDate = CFG_ENDDATE;
 
-	Capital = 10000;
-	Leverage = 500;
+	Capital = CFG_CAPITAL;
+	Leverage = CFG_LEVERAGE;
 	Hedge = 2;
 	EndWeek = 52200;
-	StopFactor = 1.5;
+	StopFactor = CFG_STOPFACTOR;
 
 	var RiskSlider = slider(1, 10, 5, 30, "Risk%x10", "Risk % x10 (10=1.0%)") / 10.0;
 	int algoMode = slider(2, 1, 1, 4, "Algo", "1=Both 2=SMA 3=CH 4=Auto");
 	int ftmoMode = slider(3, 1, 1, 3, "FTMO", "1=Off 2=1-Step 3=2-Step");
+
+	// Struktúra paraméterek (fix define-ból)
+	int smaCool    = SMA_COOLDOWN;
+	int smaLayers  = SMA_MAX_LAYERS;
+	var smaPartial = SMA_PARTIAL_ATR;
+	int chMaxPos   = CH_MAX_POS;
 
 	if(is(INITRUN))
 	{
@@ -97,7 +150,8 @@ function run()
 			assetSessEnd[k] = 20;
 		}
 
-		string csv = file_content("Strategy\\MLDRIVEN_Assets.csv");
+		string csv = file_content("Strategy/MLDRIVEN_Assets.csv");
+		if(!csv) csv = file_content("MLDRIVEN_Assets.csv");
 		if(csv)
 		{
 			// Known asset order — parse each from CSV
@@ -224,9 +278,9 @@ function run()
 			ftmoHighBalance = Balance;
 
 		// 1-Step: 3% daily, 10% max trailing | 2-Step: 5% daily, 10% max
-		var dailyLossLimit = ftmoStartBalance * 0.05;
-		if(ftmoMode == 2) dailyLossLimit = ftmoStartBalance * 0.03;
-		var maxLossLimit = ftmoStartBalance * 0.10;
+		var dailyLossLimit = ftmoStartBalance * FTMO_DAILY_2STEP;
+		if(ftmoMode == 2) dailyLossLimit = ftmoStartBalance * FTMO_DAILY_1STEP;
+		var maxLossLimit = ftmoStartBalance * FTMO_MAX_LOSS;
 		var dailyLoss = ftmoDayStart - equity;
 		var totalLoss = ftmoHighBalance - equity;
 
@@ -242,7 +296,7 @@ function run()
 		}
 
 		// Best Day Rule (1-Step only)
-		if(ftmoMode == 2 && ftmoTotalProfit > 0 && ftmoBestDayProfit > ftmoTotalProfit * 0.50)
+		if(ftmoMode == 2 && ftmoTotalProfit > 0 && ftmoBestDayProfit > ftmoTotalProfit * FTMO_BESTDAY_RULE)
 		{
 			if(Bar % 500 == 0)
 				printf("\n[FTMO] BEST DAY WARNING: best=%.0f total=%.0f (%.0f%%)",
@@ -267,14 +321,14 @@ function run()
 			}
 
 			// Reset next day
-			if(today != ftmoLastDay || dailyLoss < dailyLossLimit * 0.5)
+			if(today != ftmoLastDay || dailyLoss < dailyLossLimit * FTMO_RESUME_RATIO)
 			{
 				// ftmoStopped stays until next day resets
 			}
 		}
 
 		// Profit target: 1-Step=10%, 2-Step Phase1=10%, Phase2=5%
-		var profitTarget = ftmoStartBalance * 0.10;
+		var profitTarget = ftmoStartBalance * FTMO_PROFIT_TARGET;
 		if(equity - ftmoStartBalance >= profitTarget && !ftmoStopped)
 		{
 			ftmoStopped = 3;
@@ -530,11 +584,11 @@ function run()
 		int chEnabled  = (effectiveAlgo == 1 || effectiveAlgo == 3);
 		int smaOK_L = (smaEnabled && smaLongSig && rsi > 45 && rsi < 70 && smaRegime && smaCanOpen);
 		int smaOK_S = (smaEnabled && smaShortSig && rsi < 55 && rsi > 30 && smaRegime && smaCanOpen);
-		int addCooldown = 12;
+		int addCooldown = smaCool;
 		int smaAddL = (smaEnabled && smaTrendL && smaRegime && layersLong[aIdx] > 0
-			&& layersLong[aIdx] < MAX_LAYERS && (Bar - lastLayerBarL[aIdx]) >= addCooldown);
+			&& layersLong[aIdx] < smaLayers && (Bar - lastLayerBarL[aIdx]) >= addCooldown);
 		int smaAddS = (smaEnabled && smaTrendS && smaRegime && layersShort[aIdx] > 0
-			&& layersShort[aIdx] < MAX_LAYERS && (Bar - lastLayerBarS[aIdx]) >= addCooldown);
+			&& layersShort[aIdx] < smaLayers && (Bar - lastLayerBarS[aIdx]) >= addCooldown);
 
 		int chRegime = (adx > adxCH && mmiVal < mmiCH);
 		// Channel extreme entry (original)
@@ -626,7 +680,7 @@ function run()
 		// SMA PARTIAL CLOSE: LIFO (largest lot first)
 		// =========================================
 		algo("SMA");
-		var partialThresh = 0.5 * h4atr; // ATR-based partial close threshold
+		var partialThresh = smaPartial * h4atr;
 		if(layersLong[aIdx] > 1)
 		{
 			for(current_trades)
@@ -660,6 +714,11 @@ function run()
 			}
 		}
 
+		// Lot számítás: 1 nAmount = 0.01 standard lot
+		// SMA: Risk/3 mert pyramid (4 layer), CH: full Risk (no pyramid)
+		int smaBaseLots = max(1, (int)(Equity * (RiskSlider / 3.0) / 100.0 / numActiveAssets));
+		int chLots      = max(1, (int)(Equity * RiskSlider / 100.0 / numActiveAssets));
+
 		// =========================================
 		// SMA FILTER (ML)
 		// =========================================
@@ -683,7 +742,11 @@ function run()
 				{
 					if(smaOK_L) smaFilterL = 0;
 					if(smaOK_S) smaFilterS = 0;
-					printf("\n[FILTER] SMA %s SKIP dir=%d", assetCode, filterDir);
+					phSmaPrice[aIdx] = price;
+					phSmaDir[aIdx] = filterDir;
+					phSmaBar[aIdx] = Bar;
+					phSmaLots[aIdx] = smaBaseLots;
+					printf("\n[FILTER] SMA %s SKIP dir=%d price=%.5f lots=%d", assetCode, filterDir, price, smaBaseLots);
 				}
 				else
 				{
@@ -720,74 +783,70 @@ function run()
 		if(NumOpenLong == 0) layersLong[aIdx] = 0;
 		if(NumOpenShort == 0) layersShort[aIdx] = 0;
 
-		var baseMargin = Equity * 0.5 / 100.0 / numActiveAssets;
-
 		// Margin safety: ne nyisson újat ha equity túl alacsony (stopout védelem)
 		var usedMargin = MarginTotal;
 		var freeMargin = Equity - usedMargin;
 		var marginLevel = 0;
 		if(usedMargin > 0) marginLevel = Equity / usedMargin * 100;
 		int safeToOpen = 1;
-		// Ha margin level < 200% VAGY free margin < baseMargin × 3 → ne nyiss
 		if(usedMargin > 0 && marginLevel < 200)
 		{
 			safeToOpen = 0;
 			if(Bar % 2000 == 0)
 				printf("\n[SAFETY] %s margin level %.0f%% < 200%% — no new trades", assetCode, marginLevel);
 		}
-		if(freeMargin < baseMargin * 3)
+		if(freeMargin < Equity * 0.1)
 		{
 			safeToOpen = 0;
 			if(Bar % 2000 == 0)
-				printf("\n[SAFETY] %s free margin %.0f < %.0f — no new trades", assetCode, freeMargin, baseMargin * 3);
+				printf("\n[SAFETY] %s free margin %.0f < 10%% equity — no new trades", assetCode, freeMargin);
 		}
 
-		if(safeToOpen && smaOK_L && smaFilterL && layersLong[aIdx] == 0
+		int smaHedgeOK_L = SMA_HEDGE || (NumOpenShort == 0);
+		int smaHedgeOK_S = SMA_HEDGE || (NumOpenLong == 0);
+
+		if(safeToOpen && smaOK_L && smaFilterL && smaHedgeOK_L && layersLong[aIdx] == 0
 			&& (Bar - lastLayerBarL[aIdx]) >= addCooldown)
 		{
-			Margin = baseMargin;
+			Lots = smaBaseLots;
 			Stop = h4atr * smaStop;
-
 			LifeTime = 0;
 			enterLong();
 			layersLong[aIdx] = 1;
 			lastLayerBarL[aIdx] = Bar;
-			printf("\n[ENTRY] SMA LONG %s @ %.5f layer=1", assetCode, price);
+			printf("\n[ENTRY] SMA LONG %s @ %.5f lots=%d (%.2f std)", assetCode, price, smaBaseLots, smaBaseLots * 0.01);
 		}
 		else if(safeToOpen && smaAddL)
 		{
-			Margin = baseMargin * (layersLong[aIdx] + 1);
+			Lots = smaBaseLots + layersLong[aIdx];
 			Stop = h4atr * smaStop;
-
 			LifeTime = 0;
 			enterLong();
 			layersLong[aIdx] = layersLong[aIdx] + 1;
 			lastLayerBarL[aIdx] = Bar;
-			printf("\n[ADD] SMA LONG %s @ %.5f layer=%d", assetCode, price, layersLong[aIdx]);
+			printf("\n[ADD] SMA LONG %s @ %.5f lots=%d layer=%d", assetCode, price, smaBaseLots + layersLong[aIdx] - 1, layersLong[aIdx]);
 		}
 
-		if(safeToOpen && smaOK_S && smaFilterS && layersShort[aIdx] == 0
+		if(safeToOpen && smaOK_S && smaFilterS && smaHedgeOK_S && layersShort[aIdx] == 0
 			&& (Bar - lastLayerBarS[aIdx]) >= addCooldown)
 		{
-			Margin = baseMargin;
+			Lots = smaBaseLots;
 			Stop = h4atr * smaStop;
-
 			LifeTime = 0;
 			enterShort();
 			layersShort[aIdx] = 1;
 			lastLayerBarS[aIdx] = Bar;
-			printf("\n[ENTRY] SMA SHORT %s @ %.5f layer=1", assetCode, price);
+			printf("\n[ENTRY] SMA SHORT %s @ %.5f lots=%d (%.2f std)", assetCode, price, smaBaseLots, smaBaseLots * 0.01);
 		}
 		else if(safeToOpen && smaAddS)
 		{
-			Margin = baseMargin * (layersShort[aIdx] + 1);
+			Lots = smaBaseLots + layersShort[aIdx];
 			Stop = h4atr * smaStop;
-
 			LifeTime = 0;
 			enterShort();
 			layersShort[aIdx] = layersShort[aIdx] + 1;
 			lastLayerBarS[aIdx] = Bar;
-			printf("\n[ADD] SMA SHORT %s @ %.5f layer=%d", assetCode, price, layersShort[aIdx]);
+			printf("\n[ADD] SMA SHORT %s @ %.5f lots=%d layer=%d", assetCode, price, smaBaseLots + layersShort[aIdx] - 1, layersShort[aIdx]);
 		}
 
 		// =========================================
@@ -815,7 +874,11 @@ function run()
 				{
 					if(chOK_L) chFilterL = 0;
 					if(chOK_S) chFilterS = 0;
-					printf("\n[FILTER] CH %s SKIP dir=%d", assetCode, chDir);
+					phChPrice[aIdx] = price;
+					phChDir[aIdx] = chDir;
+					phChBar[aIdx] = Bar;
+					phChLots[aIdx] = chLots;
+					printf("\n[FILTER] CH %s SKIP dir=%d price=%.5f lots=%d", assetCode, chDir, price, chLots);
 				}
 				else
 				{
@@ -832,22 +895,58 @@ function run()
 		// CH ENTRY (fix lot, LifeTime, no overnight)
 		// =========================================
 		algo("CH");
-		if(safeToOpen && chOK_L && chFilterL && NumOpenLong < 2 && !sessionEnd)
+		int chHedgeOK_L = CH_HEDGE || (NumOpenShort == 0);
+		int chHedgeOK_S = CH_HEDGE || (NumOpenLong == 0);
+
+		if(safeToOpen && chOK_L && chFilterL && chHedgeOK_L && NumOpenLong < chMaxPos && !sessionEnd)
 		{
-			Margin = baseMargin;
+			Lots = chLots;
 			Stop = h4atr * chStop;
 			LifeTime = 0;
 			enterLong();
-			printf("\n[ENTRY] CH LONG %s @ %.5f", assetCode, price);
+			printf("\n[ENTRY] CH LONG %s @ %.5f lots=%d (%.2f std)", assetCode, price, chLots, chLots * 0.01);
 		}
 
-		if(safeToOpen && chOK_S && chFilterS && NumOpenShort < 2 && !sessionEnd)
+		if(safeToOpen && chOK_S && chFilterS && chHedgeOK_S && NumOpenShort < chMaxPos && !sessionEnd)
 		{
-			Margin = baseMargin;
+			Lots = chLots;
 			Stop = h4atr * chStop;
 			LifeTime = 0;
 			enterShort();
-			printf("\n[ENTRY] CH SHORT %s @ %.5f", assetCode, price);
+			printf("\n[ENTRY] CH SHORT %s @ %.5f lots=%d (%.2f std)", assetCode, price, chLots, chLots * 0.01);
+		}
+
+		// =========================================
+		// PHANTOM KIÉRTÉKELÉS (SKIP trade-ek N bar múlva)
+		// =========================================
+		if(phSmaBar[aIdx] > 0 && (Bar - phSmaBar[aIdx]) >= PHANTOM_EVAL_BARS)
+		{
+			var pnlPips = (price - phSmaPrice[aIdx]) * phSmaDir[aIdx] / PIP;
+			// Pip $ érték: XXX/USD = PIP*1000, USD/XXX = PIP*1000/price
+			var pipDollar = PIP * 1000.0;
+			if(!strstr(Asset, "/USD")) pipDollar = PIP * 1000.0 / price;
+			var pnlDollar = pnlPips * pipDollar * (var)phSmaLots[aIdx];
+			if(pnlPips > 0) { phSmaWin++; }
+			else { phSmaLoss++; }
+			phSmaPnl = phSmaPnl + pnlDollar;
+			printf("\n[PHANTOM] SMA %s dir=%d lots=%d pnl=%.1f pips $%.2f | W:%d L:%d Total:$%.2f",
+				assetCode, phSmaDir[aIdx], phSmaLots[aIdx], pnlPips, pnlDollar,
+				phSmaWin, phSmaLoss, phSmaPnl);
+			phSmaBar[aIdx] = 0;
+		}
+		if(phChBar[aIdx] > 0 && (Bar - phChBar[aIdx]) >= PHANTOM_EVAL_BARS)
+		{
+			var pnlPips = (price - phChPrice[aIdx]) * phChDir[aIdx] / PIP;
+			var pipDollar = PIP * 1000.0;
+			if(!strstr(Asset, "/USD")) pipDollar = PIP * 1000.0 / price;
+			var pnlDollar = pnlPips * pipDollar * (var)phChLots[aIdx];
+			if(pnlPips > 0) { phChWin++; }
+			else { phChLoss++; }
+			phChPnl = phChPnl + pnlDollar;
+			printf("\n[PHANTOM] CH %s dir=%d lots=%d pnl=%.1f pips $%.2f | W:%d L:%d Total:$%.2f",
+				assetCode, phChDir[aIdx], phChLots[aIdx], pnlPips, pnlDollar,
+				phChWin, phChLoss, phChPnl);
+			phChBar[aIdx] = 0;
 		}
 
 		// =========================================

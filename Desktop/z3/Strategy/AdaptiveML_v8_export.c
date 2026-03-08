@@ -17,12 +17,16 @@ function run()
 
 	BarPeriod = 15;
 	LookBack = 300;
-	StartDate = 20200101;
+	StartDate = 20230102;
 	EndDate = 20260301;
 
 	Capital = 72000;
 	Leverage = 500;
 	Hedge = 2;
+
+	// WFO — MUST match AdaptiveML_v8.c!
+	NumWFOCycles = -8;
+	DataSplit = 80;
 
 	// === CSV HEADER (egyszer, Bar==0) ===
 	if(Bar == 0)

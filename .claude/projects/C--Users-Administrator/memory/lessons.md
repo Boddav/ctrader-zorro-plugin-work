@@ -8,6 +8,7 @@
 5. **Tanár újratréning** backup nélkül — PF 1.59 → 1.01 lett
 6. **TREND-CLOSE tanárban** — PF 1.09 → 1.04 (diákban OK mert ML filter előszűr)
 7. **Auto algo_vote (slider 4)** — filter modell nem elég pontos algo választásra
+8. **Diák optimize()** set(PARAMETERS) — .par algo-nként szétválik, szerver+Train instabil → PF 0.78
 
 ## MINDIG MŰKÖDIK
 1. **ML = szűrő (GO/SKIP)**, nem irány-prediktor — PF 1.02 → 1.60
