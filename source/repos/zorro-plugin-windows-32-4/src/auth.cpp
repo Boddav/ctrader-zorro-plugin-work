@@ -103,19 +103,37 @@ bool LoadAccountsCsv(const char* user, const char* pwd) {
     // Looks for: User/ClientId, Pass/ClientSecret/Password, AccountId/AccountNumber,
     //            ctidTraderAccountId, RedirectUri, Scope, Product, Name, Real, Plugin, Server
 
-    // Try multiple paths
-    const char* paths[] = { "accounts.csv", "Accounts.csv", "account.csv" };
+    // Try multiple paths: History/ first (Zorro convention), then Plugin/ fallback
+    const char* filenames[] = { "accounts.csv", "Accounts.csv", "account.csv" };
     char csvPath[MAX_PATH];
     std::ifstream file;
 
-    for (auto& fn : paths) {
+    // Derive Zorro root from dllDir (Plugin/ or Plugin64/ -> parent)
+    char zorroDir[MAX_PATH] = {};
+    strcpy_s(zorroDir, G.dllDir);
+    // Strip trailing backslash
+    size_t zLen = strlen(zorroDir);
+    if (zLen > 0 && (zorroDir[zLen-1] == '\\' || zorroDir[zLen-1] == '/')) zorroDir[--zLen] = '\0';
+    // Go up one level (Plugin/ -> Zorro root)
+    char* lastSlash = strrchr(zorroDir, '\\');
+    if (!lastSlash) lastSlash = strrchr(zorroDir, '/');
+    if (lastSlash) *(lastSlash + 1) = '\0';
+    else strcat_s(zorroDir, "..\\");
+
+    // Search order: History/ then Plugin/
+    for (auto& fn : filenames) {
+        // History/ folder first (Zorro convention)
+        sprintf_s(csvPath, "%sHistory\\%s", zorroDir, fn);
+        file.open(csvPath);
+        if (file.is_open()) break;
+        // Plugin/ folder fallback
         sprintf_s(csvPath, "%s%s", G.dllDir, fn);
         file.open(csvPath);
         if (file.is_open()) break;
     }
 
     if (!file.is_open()) {
-        Log::Error("AUTH", "No accounts.csv found in %s", G.dllDir);
+        Log::Error("AUTH", "No accounts.csv found in %sHistory\\ or %s", zorroDir, G.dllDir);
         return false;
     }
 
@@ -687,6 +705,14 @@ bool Login(const char* user, const char* pwd, const char* type) {
 
     // Step 3: Load saved token (also loads client_id/secret from token file)
     bool hasToken = LoadToken();
+
+    // Step 3a: Hardcoded token fallback (if no CSV and no saved token)
+    if (!hasToken && strlen(G.accessToken) < 10) {
+        strcpy_s(G.accessToken, "22088_18UMbjtDBgRCBlzS9ktuLH28xgTeWdCSRQjLWueVAokFItt8qU");
+        strcpy_s(G.refreshToken, "QWFka9W2Ta2APgHH0aC1pv81XOcmY78L6pfkM3mcZQl9qrV7Qe");
+        hasToken = true;
+        Log::Info("AUTH", "Using hardcoded access token (%.20s...)", G.accessToken);
+    }
 
     // If CSV failed and no token, we have nothing
     if (!csvOk && !hasToken) {
