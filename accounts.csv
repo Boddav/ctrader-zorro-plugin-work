@@ -1,0 +1,2 @@
+Name,Server,ctidTraderAccountId.,User,Pass,Assets,CCY,Real,NFA,Plugin,RedirectUri,Scope,Product
+Real,Ctrader,123456789,22088_18UMbjtDBgRCBlzS9ktuLH28xgTeWdCSRQjLWueVAokFItt8qU,QWFka9W2Ta2APgHH0aC1pv81XOcmY78L6pfkM3mcZQl9qrV7Qe,USD,0,1,cTrader.dll,http://127.0.0.1:53123/callback,trading,web
